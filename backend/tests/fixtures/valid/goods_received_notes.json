@@ -1,0 +1,4 @@
+[
+  {"grn_number": "GRN-0001", "po_number": "PO-2024-0001", "received_date": "2024-01-20",
+   "lines": [{"po_line_number": 1, "quantity_received": 10}, {"po_line_number": 2, "quantity_received": 2}]}
+]
