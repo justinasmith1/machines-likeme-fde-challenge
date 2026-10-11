@@ -1,0 +1,98 @@
+[
+  {
+    "filename": "INV-01.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "AUTO_PAY",
+    "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "NOS-2026-1187 against PO-2026-0101."
+  },
+  {
+    "filename": "INV-02.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "AUTO_PAY",
+    "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "MH-2026-0457 against PO-2026-0102. Line 1 received in two GRNs (10 + 5 = 15). First occurrence by upload order (see DL-25 and DL-06)."
+  },
+  {
+    "filename": "INV-03.png",
+    "document_type": "invoice",
+    "expected_outcome": "AUTO_PAY",
+    "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "SWC-4471 against PO-2026-0103. Image input."
+  },
+  {
+    "filename": "INV-04.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "AUTO_PAY",
+    "expected_reasons": ["Price difference within 2% tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "BPC-2026-08-0091 against PO-2026-0104. Storage 21.30 vs 21.00 = +1.43%."
+  },
+  {
+    "filename": "INV-05.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "HELD_FOR_REVIEW",
+    "expected_reasons": ["Unit price 218.40 differs from PO price 210.00 by 4%, beyond 2% tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "NOS-2026-1243 against PO-2026-0105."
+  },
+  {
+    "filename": "INV-06.png",
+    "document_type": "invoice",
+    "expected_outcome": "HELD_FOR_REVIEW",
+    "expected_reasons": ["Unit price 9.90 differs from PO price 9.00 by 10%, beyond 2% tolerance"],
+    "expected_extraction": "TODO",
+    "notes": "MH-2026-0512 against PO-2026-0106. Total 7,559.47 exceeds 5,000 analyst limit, so any override needs the AP Manager. Printed VAT 1,311.97 vs computed 1,311.975 is within 0.01 rounding (DL-17) and is not a hold reason."
+  },
+  {
+    "filename": "INV-07.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "HELD_FOR_REVIEW",
+    "expected_reasons": ["Quantity invoiced (10) exceeds quantity received (8)"],
+    "expected_extraction": "TODO",
+    "notes": "RFL-A-00932 against PO-2026-0107."
+  },
+  {
+    "filename": "INV-08.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "REJECTED",
+    "expected_reasons": ["Duplicate of an invoice already processed (same supplier and invoice number)"],
+    "expected_extraction": "TODO",
+    "notes": "Copy of MH-2026-0457 (INV-02). Rejected because INV-02 was processed first. Depends on DL-25."
+  },
+  {
+    "filename": "INV-09.png",
+    "document_type": "invoice",
+    "expected_outcome": "HELD_FOR_REVIEW",
+    "expected_reasons": ["Quantity field is illegible"],
+    "expected_extraction": "TODO",
+    "notes": "SWC-4519 against PO-2026-0108. Line total 768.00 at 32.00 implies 24 units, but the engine must not infer it (DL-18)."
+  },
+  {
+    "filename": "INV-10.pdf",
+    "document_type": "quotation",
+    "expected_outcome": null,
+    "expected_reasons": ["Document is a quotation, not an invoice"],
+    "expected_extraction": "TODO",
+    "notes": "QUO-2026-118. Must be classified before the rule engine runs (DL-16)."
+  },
+  {
+    "filename": "INV-11.pdf",
+    "document_type": "invoice",
+    "expected_outcome": "REJECTED",
+    "expected_reasons": ["Referenced purchase order PO-2026-0199 does not exist"],
+    "expected_extraction": "TODO",
+    "notes": "NOS-2026-1301."
+  },
+  {
+    "filename": "INV-12.png",
+    "document_type": "invoice",
+    "expected_outcome": "HELD_FOR_REVIEW",
+    "expected_reasons": ["Purchase order number is partially illegible"],
+    "expected_extraction": "TODO",
+    "notes": "BPC-2026-08-0140. Visible digits suggest PO-2026-0119, but the engine must not guess the PO (DL-19)."
+  }
+]
