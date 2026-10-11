@@ -1,0 +1,4 @@
+[
+  {"supplier_id": "SUP-001", "legal_name": "Test Supplier A", "tax_id": "TAX-A", "default_currency": "USD", "status": "active"},
+  {"supplier_id": "SUP-002", "legal_name": "Test Supplier B", "tax_id": "TAX-B", "default_currency": "EUR", "status": "inactive"}
+]

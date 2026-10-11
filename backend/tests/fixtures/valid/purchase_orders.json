@@ -1,0 +1,9 @@
+[
+  {"po_number": "PO-2024-0001", "supplier_id": "SUP-001", "po_date": "2024-01-15", "currency": "USD", "status": "open",
+   "lines": [
+     {"line_number": 1, "item_code": "ITEM-1", "description": "Widget", "quantity_ordered": 10, "unit_price": "5.50"},
+     {"line_number": 2, "item_code": "ITEM-2", "description": "Gadget", "quantity_ordered": 4, "unit_price": "20.00"}
+   ]},
+  {"po_number": "PO-2024-0002", "supplier_id": "SUP-002", "po_date": "2024-02-01", "currency": "EUR", "status": "closed",
+   "lines": [{"line_number": 1, "item_code": "ITEM-3", "description": "Gizmo", "quantity_ordered": 1, "unit_price": "100.00"}]}
+]
