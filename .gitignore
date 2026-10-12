@@ -16,3 +16,6 @@ data/reference/*.json
 data/test-invoices/*
 !data/reference/.gitkeep
 !data/test-invoices/.gitkeep
+
+# Model responses and evaluation reports contain real invoice data
+data/cache/

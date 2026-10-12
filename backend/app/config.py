@@ -1,14 +1,22 @@
 from decimal import Decimal
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # .env is looked up at the repo root and in backend/, whatever the working directory.
+    model_config = SettingsConfigDict(
+        env_file=(REPO_ROOT / ".env", REPO_ROOT / "backend" / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    # Azure OpenAI is optional for now so the app starts without it.
+    # Azure OpenAI is optional so the app starts without it.
     # The key is a SecretStr: repr/str show '**********', never the value.
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: SecretStr | None = None
@@ -19,6 +27,20 @@ class Settings(BaseSettings):
 
     reference_data_dir: str = "data/reference"
     database_url: str = "sqlite:///./contoso.db"
+
+    # Extraction (phase 3)
+    extraction_max_retries: int = 3  # retries after the first attempt, per call
+    extraction_timeout_seconds: float = 90.0
+    extraction_cache_dir: str = "data/cache/extractions"
+    pdf_render_dpi: int = 170
+    pdf_max_pages: int = 5
+    max_upload_mb: int = 10
+
+    @property
+    def extraction_cache_path(self) -> Path:
+        """Cache directory; a relative value is resolved against the repo root."""
+        path = Path(self.extraction_cache_dir)
+        return path if path.is_absolute() else REPO_ROOT / path
 
 
 @lru_cache
