@@ -43,6 +43,9 @@ class ExtractedInvoice(BaseModel):
     invoice_number: str | None = None
     invoice_date: date | None = None
     po_number: str | None = None
+    # True when the PO number is printed but partially illegible (DL-19, DL-31).
+    # Distinguishes "illegible" (A7, hold) from "no PO referenced" (R1, reject).
+    po_number_illegible: bool = False
     currency: str | None = None
     lines: list[ExtractedInvoiceLine] = []
     subtotal: Decimal | None = None

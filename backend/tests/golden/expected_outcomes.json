@@ -5,7 +5,7 @@
     "expected_outcome": "AUTO_PAY",
     "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
     "expected_extraction": "TODO",
-    "notes": "NOS-2026-1187 against PO-2026-0101."
+    "notes": "All lines match the purchase order; quantities fully received; prices exact."
   },
   {
     "filename": "INV-02.pdf",
@@ -13,7 +13,7 @@
     "expected_outcome": "AUTO_PAY",
     "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
     "expected_extraction": "TODO",
-    "notes": "MH-2026-0457 against PO-2026-0102. Line 1 received in two GRNs (10 + 5 = 15). First occurrence by upload order (see DL-25 and DL-06)."
+    "notes": "Two GRN lines summing to the invoiced quantity; prices exact. First occurrence by upload order (DL-06, DL-25)."
   },
   {
     "filename": "INV-03.png",
@@ -21,7 +21,7 @@
     "expected_outcome": "AUTO_PAY",
     "expected_reasons": ["All lines match the purchase order", "Quantities covered by goods received", "Prices within tolerance"],
     "expected_extraction": "TODO",
-    "notes": "SWC-4471 against PO-2026-0103. Image input."
+    "notes": "Single line fully received; prices exact. Image input."
   },
   {
     "filename": "INV-04.pdf",
@@ -29,31 +29,31 @@
     "expected_outcome": "AUTO_PAY",
     "expected_reasons": ["Price difference within 2% tolerance"],
     "expected_extraction": "TODO",
-    "notes": "BPC-2026-08-0091 against PO-2026-0104. Storage 21.30 vs 21.00 = +1.43%."
+    "notes": "Unit price difference just inside the configured tolerance."
   },
   {
     "filename": "INV-05.pdf",
     "document_type": "invoice",
     "expected_outcome": "HELD_FOR_REVIEW",
-    "expected_reasons": ["Unit price 218.40 differs from PO price 210.00 by 4%, beyond 2% tolerance"],
+    "expected_reasons": ["Unit price differs from the purchase order price beyond the configured tolerance"],
     "expected_extraction": "TODO",
-    "notes": "NOS-2026-1243 against PO-2026-0105."
+    "notes": "Unit price difference beyond the configured tolerance."
   },
   {
     "filename": "INV-06.png",
     "document_type": "invoice",
     "expected_outcome": "HELD_FOR_REVIEW",
-    "expected_reasons": ["Unit price 9.90 differs from PO price 9.00 by 10%, beyond 2% tolerance"],
+    "expected_reasons": ["Unit price differs from the purchase order price beyond the configured tolerance"],
     "expected_extraction": "TODO",
-    "notes": "MH-2026-0512 against PO-2026-0106. Total 7,559.47 exceeds 5,000 analyst limit, so any override needs the AP Manager. Printed VAT 1,311.97 vs computed 1,311.975 is within 0.01 rounding (DL-17) and is not a hold reason."
+    "notes": "Unit price difference beyond the configured tolerance on one line. Total above the analyst approval limit, so any override needs the AP Manager. Printed tax is within the rounding tolerance (DL-17) and is not a hold reason."
   },
   {
     "filename": "INV-07.pdf",
     "document_type": "invoice",
     "expected_outcome": "HELD_FOR_REVIEW",
-    "expected_reasons": ["Quantity invoiced (10) exceeds quantity received (8)"],
+    "expected_reasons": ["Invoiced quantity exceeds quantity received"],
     "expected_extraction": "TODO",
-    "notes": "RFL-A-00932 against PO-2026-0107."
+    "notes": "Invoiced quantity exceeds the quantity received."
   },
   {
     "filename": "INV-08.pdf",
@@ -61,7 +61,7 @@
     "expected_outcome": "REJECTED",
     "expected_reasons": ["Duplicate of an invoice already processed (same supplier and invoice number)"],
     "expected_extraction": "TODO",
-    "notes": "Copy of MH-2026-0457 (INV-02). Rejected because INV-02 was processed first. Depends on DL-25."
+    "notes": "Duplicate of an invoice already processed for the same supplier. Rejected because the first copy was processed earlier (DL-25)."
   },
   {
     "filename": "INV-09.png",
@@ -69,7 +69,7 @@
     "expected_outcome": "HELD_FOR_REVIEW",
     "expected_reasons": ["Quantity field is illegible"],
     "expected_extraction": "TODO",
-    "notes": "SWC-4519 against PO-2026-0108. Line total 768.00 at 32.00 implies 24 units, but the engine must not infer it (DL-18)."
+    "notes": "Quantity field unreadable in the document. It could be derived from the line total, but the engine must not infer it (DL-18)."
   },
   {
     "filename": "INV-10.pdf",
@@ -77,15 +77,15 @@
     "expected_outcome": null,
     "expected_reasons": ["Document is a quotation, not an invoice"],
     "expected_extraction": "TODO",
-    "notes": "QUO-2026-118. Must be classified before the rule engine runs (DL-16)."
+    "notes": "Document is a quotation, not an invoice. Must be classified before the rule engine runs (DL-16)."
   },
   {
     "filename": "INV-11.pdf",
     "document_type": "invoice",
     "expected_outcome": "REJECTED",
-    "expected_reasons": ["Referenced purchase order PO-2026-0199 does not exist"],
+    "expected_reasons": ["Referenced purchase order does not exist"],
     "expected_extraction": "TODO",
-    "notes": "NOS-2026-1301."
+    "notes": "Referenced purchase order does not exist."
   },
   {
     "filename": "INV-12.png",
@@ -93,6 +93,6 @@
     "expected_outcome": "HELD_FOR_REVIEW",
     "expected_reasons": ["Purchase order number is partially illegible"],
     "expected_extraction": "TODO",
-    "notes": "BPC-2026-08-0140. Visible digits suggest PO-2026-0119, but the engine must not guess the PO (DL-19)."
+    "notes": "Purchase order number partially unreadable. The engine must not guess the purchase order (DL-19)."
   }
 ]
