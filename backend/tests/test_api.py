@@ -85,7 +85,66 @@ def test_me_returns_the_current_user_and_role(client):
     assert client.get("/api/me", headers=ANALYST).json() == {
         "username": "ana.analyst",
         "role": "AP_ANALYST",
+        "upload": {"max_mb": 10, "extensions": [".pdf", ".png", ".jpg", ".jpeg"]},
     }
+
+
+def test_me_reports_the_configured_upload_limit(tmp_path):
+    api = Api(tmp_path, max_upload_mb=3)
+    with TestClient(api.app) as client:
+        assert client.get("/api/me", headers=INTAKE).json()["upload"]["max_mb"] == 3
+
+
+def _actions(client, invoice_id, headers) -> dict:
+    return client.get(f"/api/invoices/{invoice_id}", headers=headers).json()["actions"]
+
+
+def test_detail_tells_a_reviewer_which_actions_are_allowed(api, client):
+    invoice_id = api.upload(client, _held_payload())
+    actions = _actions(client, invoice_id, ANALYST)
+    assert [d["decision"] for d in actions["decisions"]] == ["APPROVE", "REJECT", "REQUEST_CREDIT_NOTE"]
+    assert all(d["allowed"] and d["notice"] is None for d in actions["decisions"])
+    assert actions["can_correct"] is True and actions["can_retry"] is False
+
+    client.post(
+        f"/api/invoices/{invoice_id}/decisions", json={"decision": "APPROVE", "comment": "ok"}, headers=ANALYST
+    )
+    after = _actions(client, invoice_id, ANALYST)
+    assert [d["decision"] for d in after["decisions"]] == ["REJECT", "REQUEST_CREDIT_NOTE"]
+
+
+def test_detail_says_when_the_approval_limit_needs_the_manager(api, client):
+    invoice_id = api.upload(client, _large_held_payload())
+    notice = "The invoice total (6,000.00) is above the analyst approval limit (5,000.00). The AP Manager must decide."
+
+    approve = _actions(client, invoice_id, ANALYST)["decisions"][0]
+    assert approve == {
+        "decision": "APPROVE", "allowed": False, "required_role": "AP_MANAGER", "notice": notice, "warning": None,
+    }
+    # What the API says is what it enforces.
+    refused = client.post(
+        f"/api/invoices/{invoice_id}/decisions", json={"decision": "APPROVE", "comment": "ok"}, headers=ANALYST
+    )
+    assert refused.status_code == 403 and _error(refused)["message"] == notice
+
+    for_manager = _actions(client, invoice_id, MANAGER)["decisions"][0]
+    assert for_manager == {
+        "decision": "APPROVE", "allowed": True, "required_role": "AP_MANAGER", "notice": notice, "warning": None,
+    }
+    reject = _actions(client, invoice_id, ANALYST)["decisions"][1]
+    assert reject == {
+        "decision": "REJECT", "allowed": True, "required_role": "AP_ANALYST", "notice": None, "warning": None,
+    }
+
+
+def test_intake_view_carries_no_actions(api, client):
+    invoice_id = api.upload(client, _held_payload())
+    assert "actions" not in client.get(f"/api/invoices/{invoice_id}", headers=INTAKE).json()
+
+
+def test_failed_extraction_offers_retry_and_nothing_else(api, client):
+    invoice_id = api.upload(client, result=failed_result())
+    assert _actions(client, invoice_id, ANALYST) == {"decisions": [], "can_correct": False, "can_retry": True}
 
 
 def test_request_without_development_headers_is_unauthenticated(client):
@@ -280,7 +339,8 @@ def test_correction_holds_with_the_reason_then_approval_releases_payment(api, cl
     assert quantity["suggestion"]["value"] == "4" and quantity["suggestion"]["is_suggestion"] is True
     assert "not a value read from the document" in quantity["suggestion"]["note"]
     assert before["evaluation"]["reasons"][0]["code"] == "A6"
-    assert before["evaluation"]["reasons"][0]["source"] == "ASSUMPTION"
+    assert before["evaluation"]["reasons"][0]["source"] == "CONFIRMED"  # fixed rule, DL-18
+    assert quantity["origin"] == {"source": "MODEL"}
     assert before["evaluation"]["reasons"][0]["decision_log_ref"] == "DL-18"
 
     corrected = client.post(
@@ -295,7 +355,17 @@ def test_correction_holds_with_the_reason_then_approval_releases_payment(api, cl
         "Extracted data was corrected by ana.analyst; a human decision is required before payment."
     )
     assert body["evaluation"]["outcome"] == "AUTO_PAY" and body["evaluation"]["reasons"] == []
-    assert body["extraction"]["lines"][0]["quantity"] == {"value": "4", "status": "read", "suggestion": None}
+    corrected = body["extraction"]["lines"][0]["quantity"]
+    assert (corrected["value"], corrected["status"], corrected["suggestion"]) == ("4", "read", None)
+    # A value typed by a person says so, with what the field was before.
+    assert corrected["origin"]["source"] == "HUMAN_CORRECTION"
+    assert corrected["origin"]["corrected_by"] == "ana.analyst"
+    assert corrected["origin"]["previous_status"] == "illegible"
+    assert corrected["origin"]["previous_value"] is None
+    assert corrected["origin"]["version"] == 2
+    # A field nobody touched is still the model's.
+    assert body["extraction"]["lines"][0]["unit_price"]["origin"] == {"source": "MODEL"}
+    assert body["extraction"]["header"]["invoice_number"]["origin"] == {"source": "MODEL"}
     assert [(v["version"], v["source"]) for v in body["extraction_versions"]] == [
         (1, "MODEL"), (2, "HUMAN_CORRECTION"),
     ]
@@ -319,6 +389,121 @@ def test_superseded_decisions_are_returned(api, client):
     assert [(d["decision"], d["superseded"], d["superseded_reason"]) for d in decisions] == [
         ("REJECT", True, "NEW_DECISION"),
         ("APPROVE", False, None),
+    ]
+
+
+# ---- origin of each field, evaluation history, supplier name, advice
+
+
+def test_corrected_plain_fields_are_listed_with_who_changed_them(api, client):
+    invoice_id = api.upload(client, _held_payload())
+    body = client.post(
+        f"/api/invoices/{invoice_id}/corrections",
+        json={
+            "corrections": {"header": {"currency": "USD", "due_date": "2026-04-01"},
+                            "lines": [{"line_number": 1, "description": "Another item"}]},
+            "comment": "Fixes.",
+        },
+        headers=MANAGER,
+    ).json()
+    corrected = body["extraction"]["corrected_fields"]
+    assert sorted(corrected) == ["currency", "due_date"]
+    assert corrected["currency"]["corrected_by"] == "max.manager"
+    assert corrected["currency"]["previous_value"] == "EUR"
+    assert corrected["currency"]["previous_status"] is None  # a plain field has no reading status
+    line = body["extraction"]["lines"][0]
+    assert sorted(line["corrected_fields"]) == ["description"]
+    assert line["corrected_fields"]["description"]["previous_value"] == "Synthetic test item"
+
+
+def test_origin_follows_the_last_person_who_corrected_the_field(api, client):
+    invoice_id = api.upload(client, {"lines": [_line(quantity=not_read("illegible"))]})
+    url = f"/api/invoices/{invoice_id}/corrections"
+    client.post(url, json={"corrections": {"lines": [{"line_number": 1, "quantity": "3"}]}, "comment": "a"}, headers=ANALYST)
+    body = client.post(
+        url, json={"corrections": {"lines": [{"line_number": 1, "quantity": "4"}]}, "comment": "b"}, headers=MANAGER
+    ).json()
+    origin = body["extraction"]["lines"][0]["quantity"]["origin"]
+    assert (origin["corrected_by"], origin["version"]) == ("max.manager", 3)
+    assert (origin["previous_value"], origin["previous_status"]) == ("3", "read")
+
+
+def test_evaluation_history_keeps_why_the_invoice_was_held_before_a_correction(api, client):
+    invoice_id = api.upload(client, {"lines": [_line(quantity=not_read("illegible"))]})
+    first = client.get(f"/api/invoices/{invoice_id}", headers=ANALYST).json()
+    assert [e["outcome"] for e in first["evaluation_history"]] == ["HELD_FOR_REVIEW"]
+
+    body = client.post(
+        f"/api/invoices/{invoice_id}/corrections",
+        json={"corrections": {"lines": [{"line_number": 1, "quantity": "4"}]}, "comment": "Read from paper."},
+        headers=ANALYST,
+    ).json()
+    history = body["evaluation_history"]
+    assert [(e["outcome"], e["extraction_version"]) for e in history] == [("HELD_FOR_REVIEW", 1), ("AUTO_PAY", 2)]
+    assert [r["code"] for r in history[0]["reasons"]] == ["A6"]
+    assert "quantity is illegible" in history[0]["reasons"][0]["message"]
+    assert history[1]["reasons"] == []
+    assert history[-1]["id"] == body["evaluation"]["id"]  # the last one is the one in force
+    assert body["evaluation"]["extraction_version"] == 2
+    assert history[0]["parameters_snapshot"]["version"] == 1
+
+
+def test_supplier_legal_name_comes_with_its_code(api, client):
+    invoice_id = api.upload(client, _held_payload())
+    detail = client.get(f"/api/invoices/{invoice_id}", headers=ANALYST).json()["invoice"]
+    assert (detail["supplier_id"], detail["supplier_name"]) == ("SUP-002", "Test Supplier B")
+    listed = client.get("/api/invoices", headers=ANALYST).json()["invoices"][0]
+    assert (listed["supplier_id"], listed["supplier_name"]) == ("SUP-002", "Test Supplier B")
+    queued = client.get("/api/review-queue", headers=ANALYST).json()["invoices"][0]
+    assert queued["supplier_name"] == "Test Supplier B"
+    assert "supplier_name" not in client.get(f"/api/invoices/{invoice_id}", headers=INTAKE).json()
+
+
+def test_unresolved_supplier_has_no_name(api, client):
+    invoice_id = api.upload(client, {"header": {"supplier_tax_id": "UNKNOWN", "supplier_name": "Nobody Ltd"}})
+    invoice = client.get(f"/api/invoices/{invoice_id}", headers=ANALYST).json()["invoice"]
+    assert invoice["supplier_id"] is None and invoice["supplier_name"] is None
+
+
+def test_releasing_payment_with_no_matched_purchase_order_carries_advice_but_is_not_blocked(api, client):
+    no_po = {"header": {"po_references": {"values": [], "status": "illegible", "suggested_values": []}}}
+    invoice_id = api.upload(client, no_po)
+    decisions = {d["decision"]: d for d in _actions(client, invoice_id, ANALYST)["decisions"]}
+    assert decisions["APPROVE"]["allowed"] is True
+    assert decisions["APPROVE"]["warning"].startswith("No purchase order is associated with this invoice")
+    assert "Consider correcting the purchase order number first." in decisions["APPROVE"]["warning"]
+    assert decisions["REJECT"]["warning"] is None  # only decisions that release payment
+
+    approved = client.post(
+        f"/api/invoices/{invoice_id}/decisions", json={"decision": "APPROVE", "comment": "PO confirmed by phone."}, headers=ANALYST
+    )
+    assert approved.status_code == 200 and approved.json()["invoice"]["status"] == "APPROVED_FOR_PAYMENT"
+
+
+def test_no_advice_when_a_line_is_matched_to_a_purchase_order(api, client):
+    invoice_id = api.upload(client, _held_payload())
+    assert all(d["warning"] is None for d in _actions(client, invoice_id, ANALYST)["decisions"])
+
+
+def test_audit_trail_says_what_a_correction_changed_and_which_rules_fired(api, client):
+    invoice_id = api.upload(client, {"lines": [_line(quantity=not_read("illegible"))]})
+    client.post(
+        f"/api/invoices/{invoice_id}/corrections",
+        json={"corrections": {"lines": [{"line_number": 1, "quantity": "4"}], "header": {"currency": "USD"}},
+              "comment": "Read from paper."},
+        headers=ANALYST,
+    )
+    events = client.get(f"/api/invoices/{invoice_id}/audit", headers=MANAGER).json()["events"]
+    evaluated = next(e for e in events if e["event_type"] == "INVOICE_EVALUATED")
+    assert evaluated["details"]["reasons"] == [
+        {"code": "A6", "message": "Line 1: quantity is illegible; the system does not infer it"}
+    ]
+    corrected = next(e for e in events if e["event_type"] == "EXTRACTION_CORRECTED")
+    assert corrected["details"]["changes"] == [
+        {"scope": "header", "line_number": None, "field": "currency",
+         "before": {"value": "EUR", "status": None}, "after": {"value": "USD", "status": None}},
+        {"scope": "line", "line_number": 1, "field": "quantity",
+         "before": {"value": None, "status": "illegible"}, "after": {"value": "4", "status": "read"}},
     ]
 
 
@@ -472,7 +657,13 @@ def test_parameters_are_seeded_on_startup_and_versioned(client):
     current = client.get("/api/parameters", headers=ANALYST).json()
     assert current["version"] == 1
     assert current["price_tolerance_pct"] == "0.02" and current["analyst_approval_limit"] == "5000.00"
-    assert current["enabled_assumption_rules"] == [f"A{n}" for n in range(1, 11)]
+    assert current["enabled_assumption_rules"] == ["A1", "A2", "A3", "A4", "A5", "A8", "A10"]
+
+    for fixed in ("A6", "A7", "A9"):
+        refused = client.put(
+            "/api/parameters", json={"values": {"enabled_assumption_rules": [fixed]}, "comment": "x"}, headers=MANAGER
+        )
+        assert refused.status_code == 422 and "neither can A6, A7 or A9" in _error(refused)["message"]
 
     updated = client.put(
         "/api/parameters",

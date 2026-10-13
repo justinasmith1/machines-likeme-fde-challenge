@@ -86,6 +86,10 @@ def evaluate_and_store(
             "extraction_version": extraction_version.version,
             "outcome": decision.outcome.value,
             "reason_codes": [reason.code for reason in decision.reasons],
+            # Code and plain-language message, so the audit trail reads on its own.
+            "reasons": [
+                {"code": reason.code, "message": reason.message} for reason in decision.reasons
+            ],
             "parameters_version": parameters.version,
         },
     )

@@ -41,7 +41,7 @@ from app.extraction.service import ExtractionResult, ExtractionStatus
 from app.rules.parameters import RuleParameters
 from app.services import parameters as parameter_service
 from app.services.common import User, record_event, utc_now
-from app.services.corrections import apply_corrections
+from app.services.corrections import apply_corrections, diff_extractions
 from app.services.errors import InvalidState, NotFound, PermissionDenied, ValidationError
 from app.services.evaluation import evaluate_and_store
 from app.storage.files import FileStore
@@ -80,6 +80,17 @@ _STATUS_AFTER_DECISION = {
 }
 # Decisions that release payment, and therefore are subject to the approval limit.
 _PAYMENT_DECISIONS = {HumanDecision.APPROVE, HumanDecision.OVERRIDE}
+# Order in which decisions are offered: the one that releases payment first.
+_DECISION_ORDER = (
+    HumanDecision.APPROVE,
+    HumanDecision.OVERRIDE,
+    HumanDecision.REJECT,
+    HumanDecision.REQUEST_CREDIT_NOTE,
+)
+_NO_PURCHASE_ORDER_WARNING = (
+    "No purchase order is associated with this invoice: none of its lines is matched to a "
+    "purchase order line. Consider correcting the purchase order number first."
+)
 SUPERSEDED_BY_DECISION = "NEW_DECISION"
 SUPERSEDED_BY_CORRECTION = "EXTRACTION_CORRECTED"
 _REVIEWER_ROLES = {Role.AP_ANALYST, Role.AP_MANAGER}
@@ -333,6 +344,8 @@ class InvoiceService:
                 "extraction_version": version.version,
                 "previous_version": previous.version,
                 "corrections": corrections,
+                # Field by field, what it was and what it is now.
+                "changes": diff_extractions(previous.payload, version.payload),
                 "comment": comment.strip(),
             },
         )
@@ -381,44 +394,16 @@ class InvoiceService:
             ) from None
         if not comment or not comment.strip():
             raise ValidationError("A comment is required to record a decision.")
-        if invoice.status == InvoiceStatus.NOT_AN_INVOICE.value:
-            raise InvalidState("This document is not an invoice and can never be approved for payment.")
-        if invoice.status not in _DECIDABLE_STATUSES:
-            raise InvalidState(
-                f"Invoice {invoice_id} is {invoice.status}; it cannot be decided on yet."
-            )
         evaluation = self.latest_evaluation(invoice_id)
-        # Paying against an engine rejection is an override; otherwise it is an approval.
-        engine_rejected = evaluation.outcome == InvoiceStatus.REJECTED.value
-        if decision is HumanDecision.APPROVE and engine_rejected:
-            raise InvalidState(
-                "The rules engine rejected this invoice. Use OVERRIDE to release payment."
-            )
-        if decision is HumanDecision.OVERRIDE and not engine_rejected:
-            raise InvalidState(
-                "OVERRIDE applies only to an invoice the rules engine rejected. Use APPROVE."
-            )
-        if _STATUS_AFTER_DECISION[decision].value == invoice.status or (
-            decision in _PAYMENT_DECISIONS and invoice.status in _PAYABLE_STATUSES
-        ):
-            raise InvalidState(
-                f"Invoice {invoice_id} is already {invoice.status}; the decision would change nothing."
-            )
+        problem = self._decision_problem(invoice, evaluation, decision)
+        if problem is not None:
+            raise InvalidState(problem)
 
         parameters = parameter_service.current_parameters(self._session, self._settings, now)
-        required_role = Role.AP_ANALYST
-        if decision in _PAYMENT_DECISIONS and (
-            invoice.total is None or invoice.total > parameters.analyst_approval_limit
-        ):
-            # Above the analyst limit, or total unknown: the AP Manager releases payment.
-            required_role = Role.AP_MANAGER
+        required_role = self._required_role(invoice, decision, parameters)
         if required_role is Role.AP_MANAGER and user.role is not Role.AP_MANAGER:
             self._deny(invoice, decision.value, user, now, "above the analyst approval limit")
-            amount = "unknown" if invoice.total is None else f"{invoice.total:,.2f}"
-            raise PermissionDenied(
-                f"The invoice total ({amount}) is above the analyst approval limit "
-                f"({parameters.analyst_approval_limit:,.2f}). The AP Manager must decide."
-            )
+            raise PermissionDenied(self._approval_limit_notice(invoice, parameters))
 
         previous_outcome = invoice.status
         superseded = self._supersede_decisions(
@@ -460,6 +445,51 @@ class InvoiceService:
         self._session.commit()
         return invoice
 
+    def allowed_actions(self, invoice_id: int, user: User) -> dict:
+        """What this user can do with this invoice right now.
+
+        The same rules decide() and the other operations enforce, so a client can show the
+        right buttons without repeating them. For each decision that applies to the
+        invoice it says whether this user may take it, which role it requires, and a
+        notice when the approval limit puts it in the AP Manager's hands (DL-49).
+        Showing or hiding a button is a convenience: the operations check again.
+        """
+        invoice = self.get_invoice(invoice_id)
+        if user.role not in _REVIEWER_ROLES:
+            return {"decisions": [], "can_correct": False, "can_retry": False}
+
+        evaluation = self.latest_evaluation(invoice_id)
+        parameters = parameter_service.current_parameters(
+            self._session, self._settings, self._clock()
+        )
+        self._session.commit()
+
+        decisions = []
+        for decision in _DECISION_ORDER:
+            if self._decision_problem(invoice, evaluation, decision) is not None:
+                continue
+            required_role = self._required_role(invoice, decision, parameters)
+            needs_manager = required_role is Role.AP_MANAGER
+            decisions.append(
+                {
+                    "decision": decision.value,
+                    "allowed": not needs_manager or user.role is Role.AP_MANAGER,
+                    "required_role": required_role.value,
+                    "notice": self._approval_limit_notice(invoice, parameters)
+                    if needs_manager
+                    else None,
+                    # Advice that does not block the decision.
+                    "warning": _NO_PURCHASE_ORDER_WARNING
+                    if decision in _PAYMENT_DECISIONS and not self._has_matched_po_line(evaluation)
+                    else None,
+                }
+            )
+        return {
+            "decisions": decisions,
+            "can_correct": self.latest_extraction(invoice_id) is not None,
+            "can_retry": invoice.status == InvoiceStatus.EXTRACTION_FAILED.value,
+        }
+
     # ---- parameters
 
     def update_parameters(self, values: dict, comment: str, user: User) -> RuleParameters:
@@ -468,6 +498,55 @@ class InvoiceService:
         )
         self._session.commit()
         return parameters
+
+    # ---- decision rules, shared by decide() and allowed_actions()
+
+    @staticmethod
+    def _decision_problem(
+        invoice: InvoiceRow, evaluation: EvaluationRow | None, decision: HumanDecision
+    ) -> str | None:
+        """Why the decision does not apply to the invoice in its status, or None if it does."""
+        if invoice.status == InvoiceStatus.NOT_AN_INVOICE.value:
+            return "This document is not an invoice and can never be approved for payment."
+        if invoice.status not in _DECIDABLE_STATUSES or evaluation is None:
+            return f"Invoice {invoice.id} is {invoice.status}; it cannot be decided on yet."
+        # Paying against an engine rejection is an override; otherwise it is an approval.
+        engine_rejected = evaluation.outcome == InvoiceStatus.REJECTED.value
+        if decision is HumanDecision.APPROVE and engine_rejected:
+            return "The rules engine rejected this invoice. Use OVERRIDE to release payment."
+        if decision is HumanDecision.OVERRIDE and not engine_rejected:
+            return "OVERRIDE applies only to an invoice the rules engine rejected. Use APPROVE."
+        if _STATUS_AFTER_DECISION[decision].value == invoice.status or (
+            decision in _PAYMENT_DECISIONS and invoice.status in _PAYABLE_STATUSES
+        ):
+            return f"Invoice {invoice.id} is already {invoice.status}; the decision would change nothing."
+        return None
+
+    @staticmethod
+    def _required_role(
+        invoice: InvoiceRow, decision: HumanDecision, parameters: RuleParameters
+    ) -> Role:
+        """Releasing payment above the analyst limit, or with no readable total, is the
+        AP Manager's decision (DL-49). Refusing payment is open to analysts."""
+        if decision in _PAYMENT_DECISIONS and (
+            invoice.total is None or invoice.total > parameters.analyst_approval_limit
+        ):
+            return Role.AP_MANAGER
+        return Role.AP_ANALYST
+
+    @staticmethod
+    def _has_matched_po_line(evaluation: EvaluationRow | None) -> bool:
+        """True when at least one invoice line was matched to a purchase order line."""
+        lines = (evaluation.matching.get("lines") if evaluation is not None else None) or []
+        return any(line.get("po_number") for line in lines)
+
+    @staticmethod
+    def _approval_limit_notice(invoice: InvoiceRow, parameters: RuleParameters) -> str:
+        amount = "unknown" if invoice.total is None else f"{invoice.total:,.2f}"
+        return (
+            f"The invoice total ({amount}) is above the analyst approval limit "
+            f"({parameters.analyst_approval_limit:,.2f}). The AP Manager must decide."
+        )
 
     # ---- internals
 

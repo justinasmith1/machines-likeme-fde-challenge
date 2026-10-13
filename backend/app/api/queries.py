@@ -3,7 +3,13 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.invoice_tables import ExtractionVersionRow, InvoiceRow, RuleParametersRow
+from app.db.invoice_tables import (
+    EvaluationRow,
+    ExtractionVersionRow,
+    InvoiceRow,
+    RuleParametersRow,
+)
+from app.db.tables import SupplierRow
 from app.domain.enums import InvoiceStatus
 
 
@@ -43,3 +49,24 @@ def parameter_history(session: Session) -> list[RuleParametersRow]:
     return list(
         session.scalars(select(RuleParametersRow).order_by(RuleParametersRow.version.desc()))
     )
+
+
+def evaluations(session: Session, invoice_id: int) -> list[EvaluationRow]:
+    """Every run of the rules engine for the invoice, oldest first."""
+    return list(
+        session.scalars(
+            select(EvaluationRow)
+            .where(EvaluationRow.invoice_id == invoice_id)
+            .order_by(EvaluationRow.id)
+        )
+    )
+
+
+def supplier_names(session: Session) -> dict[str, str]:
+    """Legal name per supplier id, from the supplier master as it is loaded now."""
+    return {
+        supplier_id: legal_name
+        for supplier_id, legal_name in session.execute(
+            select(SupplierRow.supplier_id, SupplierRow.legal_name)
+        )
+    }

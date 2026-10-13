@@ -1,8 +1,9 @@
 """Map a validated model extraction to the ExtractedInvoice the rules engine consumes.
 
 Rules of the mapping:
-  - quantity / unit_price not "read"      -> None (engine rule A6).
-  - invoice_number / invoice_date not "read" -> None (engine rule A9).
+  - quantity / unit_price not "read"      -> None (engine rule A6, always on).
+  - invoice_number / invoice_date not "read" -> None (engine rule A9, always on), with
+    invoice_number_illegible / invoice_date_illegible telling "illegible" from "absent".
   - po_references "illegible"             -> no PO and po_number_illegible=True (A7, not R1).
   - po_references "absent"                -> no PO (R1).
   - Suggested values never reach the engine (DL-18, DL-39).
@@ -51,6 +52,8 @@ def to_engine_input(extraction: ModelExtraction) -> MappedInvoice:
         supplier_tax_id=header.supplier_tax_id,
         invoice_number=header.invoice_number.value,
         invoice_date=header.invoice_date.value,
+        invoice_number_illegible=header.invoice_number.status == "illegible",
+        invoice_date_illegible=header.invoice_date.status == "illegible",
         po_number=references[0] if references else None,
         po_number_illegible=header.po_references.status == "illegible",
         currency=header.currency,

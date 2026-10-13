@@ -102,6 +102,24 @@ def test_a6_illegible_price_holds_without_inferring_and_without_h2():
     assert decision.outcome is Outcome.HELD_FOR_REVIEW
 
 
+def test_a6_is_confirmed_by_the_client_and_fires_with_every_assumption_off():
+    params = RuleParameters(enabled_assumption_rules=frozenset())
+    for invoice in (make_invoice(quantity=None), make_invoice(unit_price=None, line_total=None)):
+        decision = evaluate(invoice, make_context(), params)
+        assert codes(decision) == ["A6"]
+        assert decision.outcome is Outcome.HELD_FOR_REVIEW
+        r = _reason(decision, "A6")
+        assert r.source is RuleSource.CONFIRMED and r.decision_log_ref == "DL-18"
+
+
+def test_fixed_rules_are_not_in_the_list_of_switchable_rules():
+    from app.rules.parameters import ALL_ASSUMPTION_RULES
+
+    assert not {"A6", "A7", "A9"} & ALL_ASSUMPTION_RULES
+    assert sorted(ALL_ASSUMPTION_RULES, key=lambda c: int(c[1:])) == ["A1", "A2", "A3", "A4", "A5", "A8", "A10"]
+    assert RuleParameters().enabled_assumption_rules == ALL_ASSUMPTION_RULES
+
+
 def test_a6_neighbour_all_fields_legible():
     assert "A6" not in codes(evaluate(make_invoice(), make_context(), P))
 
@@ -157,9 +175,42 @@ def test_a9_missing_invoice_number_holds():
     decision = evaluate(make_invoice(invoice_number=None), make_context(), P)
     assert codes(decision) == ["A9"]
     r = _reason(decision, "A9")
+    # Absent from the document: an assumption (DL-35), although the rule is fixed.
     assert r.source is RuleSource.ASSUMPTION and r.decision_log_ref == "DL-35"
     assert r.message == "Invoice number is missing or unreadable; duplicate check cannot be performed"
     assert decision.outcome is Outcome.HELD_FOR_REVIEW
+
+
+def test_a9_illegible_invoice_number_holds_as_confirmed_by_the_client():
+    decision = evaluate(make_invoice(invoice_number=None, invoice_number_illegible=True), make_context(), P)
+    assert codes(decision) == ["A9"]
+    r = _reason(decision, "A9")
+    assert r.source is RuleSource.CONFIRMED and r.decision_log_ref == "DL-18"
+    assert decision.outcome is Outcome.HELD_FOR_REVIEW
+
+
+def test_a9_illegible_and_absent_invoice_date_differ_only_in_origin():
+    illegible = evaluate(make_invoice(invoice_date=None, invoice_date_illegible=True), make_context(), P)
+    absent = evaluate(make_invoice(invoice_date=None), make_context(), P)
+    assert codes(illegible) == codes(absent) == ["A9"]
+    assert illegible.outcome is absent.outcome is Outcome.HELD_FOR_REVIEW
+    assert _reason(illegible, "A9").message == _reason(absent, "A9").message
+    assert (_reason(illegible, "A9").source, _reason(illegible, "A9").decision_log_ref) == (RuleSource.CONFIRMED, "DL-18")
+    assert (_reason(absent, "A9").source, _reason(absent, "A9").decision_log_ref) == (RuleSource.ASSUMPTION, "DL-35")
+
+
+def test_a9_origin_is_decided_per_field():
+    invoice = make_invoice(invoice_number=None, invoice_number_illegible=True, invoice_date=None)
+    decision = evaluate(invoice, make_context(), P)
+    assert [(r.code, r.source, r.decision_log_ref) for r in decision.reasons] == [
+        ("A9", RuleSource.CONFIRMED, "DL-18"),  # number: illegible
+        ("A9", RuleSource.ASSUMPTION, "DL-35"),  # date: absent
+    ]
+
+
+def test_a9_ignores_the_illegible_mark_when_the_value_is_there():
+    invoice = make_invoice(invoice_number_illegible=True, invoice_date_illegible=True)
+    assert "A9" not in codes(evaluate(invoice, make_context(), P))
 
 
 def test_a9_missing_invoice_date_holds():
@@ -175,11 +226,31 @@ def test_a9_neighbour_number_and_date_present():
     assert "A9" not in codes(evaluate(make_invoice(), make_context(), P))
 
 
-def test_a9_disabled_without_other_reasons_is_auto_pay():
+def test_a9_is_a_fixed_rule_and_fires_with_every_assumption_off():
     params = RuleParameters(enabled_assumption_rules=frozenset())
     decision = evaluate(make_invoice(invoice_number=None, invoice_date=None), make_context(), params)
-    assert decision.reasons == []
-    assert decision.outcome is Outcome.AUTO_PAY
+    assert codes(decision) == ["A9", "A9"]  # one reason per missing field
+    # Tagged as an assumption (DL-35) and still not switchable.
+    assert all(r.source is RuleSource.ASSUMPTION for r in decision.reasons)
+    assert decision.outcome is Outcome.HELD_FOR_REVIEW
+
+    illegible = make_invoice(
+        invoice_number=None, invoice_date=None, invoice_number_illegible=True, invoice_date_illegible=True
+    )
+    decision = evaluate(illegible, make_context(), params)
+    assert codes(decision) == ["A9", "A9"]
+    assert all(r.source is RuleSource.CONFIRMED for r in decision.reasons)
+    assert decision.outcome is Outcome.HELD_FOR_REVIEW
+
+
+def test_a7_is_a_fixed_rule_and_fires_with_every_assumption_off():
+    params = RuleParameters(enabled_assumption_rules=frozenset())
+    invoice = make_invoice(po_number=None, po_number_illegible=True)
+    decision = evaluate(invoice, make_context(line_mapping={1: None}), params)
+    assert codes(decision) == ["A7"]
+    r = _reason(decision, "A7")
+    assert r.source is RuleSource.CONFIRMED and r.decision_log_ref == "DL-18"
+    assert decision.outcome is Outcome.HELD_FOR_REVIEW
 
 
 def _two_po_context():

@@ -649,6 +649,130 @@ def test_a_document_that_is_not_an_invoice_can_never_be_decided(harness, decisio
     assert invoice.status == InvoiceStatus.NOT_AN_INVOICE.value
 
 
+# ---- allowed actions: the same rules, exposed for clients
+
+
+def _allowed(harness, invoice, user) -> dict:
+    return harness.service.allowed_actions(invoice.id, user)
+
+
+def _decision_names(actions) -> list[str]:
+    return [d["decision"] for d in actions["decisions"]]
+
+
+def test_allowed_actions_follow_the_status_and_the_engine_outcome(harness):
+    held = harness.submit(_held_payload())
+    assert _decision_names(_allowed(harness, held, ANALYST)) == ["APPROVE", "REJECT", "REQUEST_CREDIT_NOTE"]
+
+    rejected = harness.submit(_rejected_payload())  # duplicate number and no PO: rejected
+    assert _decision_names(_allowed(harness, rejected, ANALYST)) == ["OVERRIDE", "REJECT", "REQUEST_CREDIT_NOTE"]
+
+    auto_pay = harness.submit({"header": {"invoice_number": read("TEST-0002")}})
+    assert auto_pay.status == InvoiceStatus.AUTO_PAY.value
+    assert _decision_names(_allowed(harness, auto_pay, ANALYST)) == ["REJECT", "REQUEST_CREDIT_NOTE"]
+
+
+def test_allowed_actions_change_after_a_decision(harness):
+    invoice = harness.submit(_held_payload())
+    harness.service.decide(invoice.id, "REJECT", "No.", ANALYST)
+    assert _decision_names(_allowed(harness, invoice, ANALYST)) == ["APPROVE", "REQUEST_CREDIT_NOTE"]
+    harness.service.decide(invoice.id, "APPROVE", "Yes.", ANALYST)
+    assert _decision_names(_allowed(harness, invoice, ANALYST)) == ["REJECT", "REQUEST_CREDIT_NOTE"]
+
+
+def test_allowed_actions_take_the_role_into_account(harness):
+    invoice = harness.submit(_held_payload())
+    assert _allowed(harness, invoice, INTAKE) == {"decisions": [], "can_correct": False, "can_retry": False}
+    for reviewer in (ANALYST, MANAGER):
+        actions = _allowed(harness, invoice, reviewer)
+        assert actions["can_correct"] is True and actions["can_retry"] is False
+        assert all(d["allowed"] for d in actions["decisions"])
+
+
+def test_allowed_actions_apply_the_approval_limit_per_role(harness):
+    invoice = harness.submit(_large_held_payload())
+    notice = (
+        "The invoice total (6,000.00) is above the analyst approval limit (5,000.00). "
+        "The AP Manager must decide."
+    )
+    for_analyst = {d["decision"]: d for d in _allowed(harness, invoice, ANALYST)["decisions"]}
+    assert for_analyst["APPROVE"] == {
+        "decision": "APPROVE", "allowed": False, "required_role": "AP_MANAGER", "notice": notice,
+        "warning": None,
+    }
+    # Refusing payment is not limited.
+    assert for_analyst["REJECT"]["allowed"] is True and for_analyst["REJECT"]["notice"] is None
+    assert for_analyst["REQUEST_CREDIT_NOTE"]["allowed"] is True
+
+    for_manager = {d["decision"]: d for d in _allowed(harness, invoice, MANAGER)["decisions"]}
+    assert for_manager["APPROVE"]["allowed"] is True
+    assert for_manager["APPROVE"]["required_role"] == "AP_MANAGER"
+    assert for_manager["APPROVE"]["notice"] == notice
+
+
+def test_allowed_actions_require_the_manager_when_the_total_is_unreadable(harness):
+    payload = _held_payload()
+    payload["header"]["total_amount"] = None
+    invoice = harness.submit(payload)
+    approve = _allowed(harness, invoice, ANALYST)["decisions"][0]
+    assert approve["allowed"] is False and approve["required_role"] == "AP_MANAGER"
+    assert "unknown" in approve["notice"]
+    assert _allowed(harness, invoice, MANAGER)["decisions"][0]["allowed"] is True
+
+
+def test_allowed_actions_apply_the_limit_to_overrides_too(harness):
+    invoice = harness.submit(_rejected_payload(total="9000.00"))
+    override = _allowed(harness, invoice, ANALYST)["decisions"][0]
+    assert override["decision"] == "OVERRIDE" and override["allowed"] is False
+    assert _allowed(harness, invoice, MANAGER)["decisions"][0]["allowed"] is True
+
+
+def test_allowed_actions_use_the_limit_in_force(harness):
+    invoice = harness.submit(_large_held_payload())
+    assert _allowed(harness, invoice, ANALYST)["decisions"][0]["allowed"] is False
+    harness.service.update_parameters({"analyst_approval_limit": "10000"}, "Raised.", MANAGER)
+    raised = _allowed(harness, invoice, ANALYST)["decisions"][0]
+    assert raised["allowed"] is True and raised["required_role"] == "AP_ANALYST" and raised["notice"] is None
+
+
+def test_allowed_actions_for_documents_that_cannot_be_decided(harness):
+    quotation = harness.submit({"document_type": "quotation"})
+    assert _allowed(harness, quotation, MANAGER) == {"decisions": [], "can_correct": True, "can_retry": False}
+
+    failed = harness.submit(result=failed_result())
+    assert _allowed(harness, failed, ANALYST) == {"decisions": [], "can_correct": False, "can_retry": True}
+
+    pending = harness.service.submit_invoice(b"pending", "pending.pdf", INTAKE)
+    assert _allowed(harness, pending, ANALYST) == {"decisions": [], "can_correct": False, "can_retry": False}
+
+
+def test_allowed_actions_after_a_correction_wait_for_a_decision(harness):
+    invoice = harness.submit({"lines": [_line(quantity=not_read("illegible"))]})
+    harness.service.correct_extraction(
+        invoice.id, {"lines": [{"line_number": 1, "quantity": "4"}]}, "Read from paper.", ANALYST
+    )
+    assert _decision_names(_allowed(harness, invoice, ANALYST)) == ["APPROVE", "REJECT", "REQUEST_CREDIT_NOTE"]
+
+
+def test_every_allowed_decision_is_accepted_and_every_other_one_is_refused(harness):
+    """allowed_actions and decide() must never disagree."""
+    payloads = [_held_payload(), _large_held_payload(), _rejected_payload(), None]
+    for number, payload in enumerate(payloads):
+        for user in (ANALYST, MANAGER):
+            for decision in ("APPROVE", "OVERRIDE", "REJECT", "REQUEST_CREDIT_NOTE"):
+                data = {"header": {}} if payload is None else {k: dict(v) if isinstance(v, dict) else v for k, v in payload.items()}
+                data.setdefault("header", {})
+                data["header"]["invoice_number"] = read(f"N-{number}-{user.username}-{decision}")
+                invoice = harness.submit(data)
+                offered = {d["decision"]: d["allowed"] for d in _allowed(harness, invoice, user)["decisions"]}
+                try:
+                    harness.service.decide(invoice.id, decision, "Checking consistency.", user)
+                    accepted = True
+                except (InvalidState, PermissionDenied):
+                    accepted = False
+                assert accepted == offered.get(decision, False), (payload, user.username, decision)
+
+
 # ---- parameters (DL-11)
 
 
@@ -715,10 +839,105 @@ def test_new_parameters_apply_to_new_evaluations_only(harness):
 
 def test_assumption_rules_can_be_switched_off_by_the_manager(harness):
     harness.service.update_parameters(
-        {"enabled_assumption_rules": ["A1", "A2"]}, "A6 off for the migration week.", MANAGER
+        {"enabled_assumption_rules": ["A1", "A2"]}, "A4 off while invoices arrive in two currencies.", MANAGER
     )
+    invoice = harness.submit({"header": {"currency": "USD"}})  # the PO is in EUR
+    assert invoice.status == InvoiceStatus.AUTO_PAY.value  # A4 no longer holds it
+
+
+def test_fixed_rules_cannot_be_switched_off(harness):
+    """A6, A7 and A9 always apply (DL-18, DL-35, DL-78)."""
+    current = harness.service.current_parameters()
+    assert not {"A6", "A7", "A9"} & current.enabled_assumption_rules
+
+    for code in ("A6", "A7", "A9"):
+        with pytest.raises(ValidationError, match="neither can A6, A7 or A9"):
+            harness.service.update_parameters({"enabled_assumption_rules": ["A1", code]}, "Trying.", MANAGER)
+    assert harness.service.current_parameters().version == 1
+
+
+def test_with_every_assumption_off_missing_data_is_still_held_or_rejected(harness):
+    harness.service.update_parameters({"enabled_assumption_rules": []}, "Every assumption off.", MANAGER)
+
+    def submit(number: str, **payload):
+        payload.setdefault("header", {})
+        payload["header"].setdefault("invoice_number", read(number))
+        invoice = harness.submit(payload)
+        reasons = harness.service.latest_evaluation(invoice.id).reasons
+        return invoice.status, [(r["code"], r["source"], r["decision_log_ref"]) for r in reasons]
+
+    assert submit("M-1", lines=[_line(quantity=not_read("illegible", suggested="4"))]) == (
+        "HELD_FOR_REVIEW", [("A6", "CONFIRMED", "DL-18")],
+    )
+    assert submit("M-2", header={"po_references": {"values": [], "status": "illegible", "suggested_values": ["PO-2026-0002"]}}) == (
+        "HELD_FOR_REVIEW", [("A7", "CONFIRMED", "DL-18")],
+    )
+    assert submit("M-3", header={"invoice_number": not_read("illegible")}) == (
+        "HELD_FOR_REVIEW", [("A9", "CONFIRMED", "DL-18")],
+    )
+    assert submit("M-4", header={"invoice_number": not_read("absent")}) == (
+        "HELD_FOR_REVIEW", [("A9", "ASSUMPTION", "DL-35")],
+    )
+    assert submit("M-5", header={"invoice_date": not_read("illegible")}) == (
+        "HELD_FOR_REVIEW", [("A9", "CONFIRMED", "DL-18")],
+    )
+    assert submit("M-6", header={"invoice_date": not_read("absent")}) == (
+        "HELD_FOR_REVIEW", [("A9", "ASSUMPTION", "DL-35")],
+    )
+    status, reasons = submit("M-7", header={"po_references": {"values": [], "status": "absent", "suggested_values": []}})
+    assert status == "REJECTED" and ("R1", "SPEC", None) in reasons
+    # The control: with the same parameters, a complete invoice is paid.
+    assert submit("M-8")[0] == "AUTO_PAY"
+
+
+def test_a_parameter_version_stored_when_those_rules_were_switchable_is_read_without_them(harness):
+    from app.db.invoice_tables import RuleParametersRow as Row
+
+    harness.service.current_parameters()
+    row = harness.session.scalars(select(Row)).one()
+    row.enabled_assumption_rules = ["A1", "A6", "A7", "A9"]
+    harness.session.commit()
+    assert harness.service.current_parameters().enabled_assumption_rules == frozenset({"A1"})
+
+
+def test_correction_event_records_each_change_with_what_it_was_before(harness):
     invoice = harness.submit({"lines": [_line(quantity=not_read("illegible"))]})
-    assert invoice.status == InvoiceStatus.AUTO_PAY.value  # A6 no longer holds it
+    harness.service.correct_extraction(
+        invoice.id, {"lines": [{"line_number": 1, "quantity": "4"}]}, "Read from paper.", ANALYST
+    )
+    corrected = next(e for e in harness.service.audit_trail(invoice.id) if e.event_type == "EXTRACTION_CORRECTED")
+    assert corrected.details["changes"] == [
+        {
+            "scope": "line",
+            "line_number": 1,
+            "field": "quantity",
+            "before": {"value": None, "status": "illegible"},
+            "after": {"value": "4", "status": "read"},
+        }
+    ]
+
+
+def test_evaluation_event_records_the_reasons_in_plain_language(harness):
+    invoice = harness.submit(_held_payload())
+    evaluated = next(e for e in harness.service.audit_trail(invoice.id) if e.event_type == "INVOICE_EVALUATED")
+    assert evaluated.details["reason_codes"] == ["H2"]
+    assert evaluated.details["reasons"][0]["code"] == "H2"
+    assert "unit price 30.00 differs from PO price 25.00" in evaluated.details["reasons"][0]["message"]
+
+
+def test_advice_when_no_line_is_matched_to_a_purchase_order(harness):
+    rejected = harness.submit(_rejected_payload())  # no PO on the document
+    override = _allowed(harness, rejected, ANALYST)["decisions"][0]
+    assert override["decision"] == "OVERRIDE" and override["allowed"] is True
+    assert override["warning"].startswith("No purchase order is associated with this invoice")
+    # Advice only: the decision is still accepted.
+    harness.service.decide(rejected.id, "OVERRIDE", "PO confirmed by purchasing.", ANALYST)
+    assert rejected.status == InvoiceStatus.OVERRIDDEN.value
+
+    held_payload = _held_payload()
+    held_payload["header"]["invoice_number"] = read("TEST-0009")
+    held = harness.submit(held_payload)
+    assert all(d["warning"] is None for d in _allowed(harness, held, ANALYST)["decisions"])
 
 
 def test_the_approval_limit_in_force_is_used_for_decisions(harness):

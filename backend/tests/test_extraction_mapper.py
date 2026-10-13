@@ -153,7 +153,10 @@ def test_absent_po_is_rejected_with_r1():
 @pytest.mark.parametrize("status", ["illegible", "absent"])
 def test_missing_invoice_number_becomes_none_and_holds_with_a9(status):
     header = {"invoice_number": not_read(status)}
-    assert to_engine_input(make_extraction(header=header)).invoice.invoice_number is None
+    invoice = to_engine_input(make_extraction(header=header)).invoice
+    assert invoice.invoice_number is None
+    assert invoice.invoice_number_illegible is (status == "illegible")
+    assert invoice.invoice_date_illegible is False
     outcome = _decide(header=header)
     assert _codes(outcome) == ["A9"]
     assert outcome.status is InvoiceStatus.HELD_FOR_REVIEW
@@ -162,8 +165,17 @@ def test_missing_invoice_number_becomes_none_and_holds_with_a9(status):
 @pytest.mark.parametrize("status", ["illegible", "absent"])
 def test_missing_invoice_date_becomes_none_and_holds_with_a9(status):
     header = {"invoice_date": not_read(status)}
-    assert to_engine_input(make_extraction(header=header)).invoice.invoice_date is None
+    invoice = to_engine_input(make_extraction(header=header)).invoice
+    assert invoice.invoice_date is None
+    assert invoice.invoice_date_illegible is (status == "illegible")
+    assert invoice.invoice_number_illegible is False
     assert _codes(_decide(header=header)) == ["A9"]
+
+
+def test_fields_that_were_read_are_not_marked_illegible():
+    invoice = to_engine_input(make_extraction()).invoice
+    assert invoice.invoice_number and invoice.invoice_date
+    assert (invoice.invoice_number_illegible, invoice.invoice_date_illegible) == (False, False)
 
 
 def test_suggested_values_never_reach_the_engine():
