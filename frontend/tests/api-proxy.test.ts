@@ -12,6 +12,7 @@ import {
   forwardToBackend,
   identityHeaders,
   maxUploadMb,
+  proxyAuthMode,
   requestHeadersFor,
   responseHeadersFor,
 } from "@/lib/proxy/forward";
@@ -144,6 +145,39 @@ describe("headers", () => {
     expect(forwarded(seen)["x-dev-role"]).toBe("AP_ANALYST");
     expect(identityHeaders(request.headers)).toEqual({ "x-dev-user": "ana.analyst", "x-dev-role": "AP_ANALYST" });
     expect(identityHeaders(new Headers())).toEqual({});
+  });
+
+  test("Entra mode: the principal Azure injects is forwarded, and the development headers never are", async () => {
+    const entra = { ...ENV, NEXT_PUBLIC_AUTH_MODE: "entra" };
+    const { fetchImpl, seen } = backend();
+    const request = new Request("http://frontend.test/api/me", {
+      headers: {
+        "X-MS-CLIENT-PRINCIPAL": "eyJjbGFpbXMiOltdfQ==",
+        "X-MS-CLIENT-PRINCIPAL-NAME": "ana@contoso.example",
+        "X-Dev-User": "mallory",
+        "X-Dev-Role": "AP_MANAGER",
+        Cookie: "AppServiceAuthSession=secret",
+        Authorization: "Bearer token",
+      },
+    });
+    await forwardToBackend(request, ["me"], { env: entra, fetchImpl });
+    expect(forwarded(seen)).toEqual({ "x-ms-client-principal": "eyJjbGFpbXMiOltdfQ==" });
+    expect(identityHeaders(request.headers, entra)).toEqual({ "x-ms-client-principal": "eyJjbGFpbXMiOltdfQ==" });
+    // Nobody signed in: nothing to forward, and the backend answers 401.
+    expect(identityHeaders(new Headers({ "X-Dev-User": "mallory", "X-Dev-Role": "AP_MANAGER" }), entra)).toEqual({});
+  });
+
+  test("development mode: a principal header sent by a client is not forwarded", () => {
+    const incoming = new Headers({ "X-MS-CLIENT-PRINCIPAL": "forged", "X-Dev-User": "ana", "X-Dev-Role": "INTAKE" });
+    expect(identityHeaders(incoming, ENV)).toEqual({ "x-dev-user": "ana", "x-dev-role": "INTAKE" });
+    expect(requestHeadersFor(incoming, ENV)["x-ms-client-principal"]).toBeUndefined();
+  });
+
+  test("the mode is read from the running server's environment, and only 'entra' switches it", () => {
+    expect(proxyAuthMode({ NEXT_PUBLIC_AUTH_MODE: "entra" })).toBe("entra");
+    for (const value of [undefined, "", "development", "ENTRA", "production"]) {
+      expect(proxyAuthMode({ NEXT_PUBLIC_AUTH_MODE: value })).toBe("development");
+    }
   });
 
   test("content type and accept are forwarded", () => {
