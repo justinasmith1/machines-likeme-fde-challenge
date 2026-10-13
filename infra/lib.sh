@@ -45,6 +45,21 @@ FILE_SHARE="${FILE_SHARE:-appdata}"
 ENV_STORAGE_NAME="${ENV_STORAGE_NAME:-appdata}"
 WEB_APP="${WEB_APP:-ca-$PREFIX-web}"
 API_APP="${API_APP:-ca-$PREFIX-api}"
+# Images in the registry, and the container inside each app.
+API_IMAGE="${API_IMAGE:-api}"
+WEB_IMAGE="${WEB_IMAGE:-web}"
+API_CONTAINER="api"
+WEB_CONTAINER="web"
+# Where the file share is mounted in the backend. Its Dockerfile puts the database, the
+# uploaded documents, the extraction cache and the reference data under this path.
+DATA_MOUNT_PATH="/app/data"
+DATA_VOLUME="appdata"
+# Secrets of the backend container app (names only; the values are typed at deploy time).
+SECRET_OPENAI_KEY="azure-openai-api-key"
+SECRET_OPENAI_ENDPOINT="azure-openai-endpoint"
+# Version of the Container Apps management API used for what the CLI has no flag for
+# (the volume with its mount options).
+CONTAINERAPP_API="2024-03-01"
 ENTRA_APP_NAME="${ENTRA_APP_NAME:-Contoso Invoice Matching (demo)}"
 DEMO_USER_PREFIX="${DEMO_USER_PREFIX:-contoso-demo}"
 
@@ -197,4 +212,45 @@ web_app_fqdn() {
   domain="$(az containerapp env show --name "$CONTAINER_ENV" --resource-group "$RESOURCE_GROUP" \
     --query properties.defaultDomain -o tsv)"
   printf '%s.%s' "$WEB_APP" "$domain"
+}
+
+app_url() { # app_url <app name>: the management address of a container app
+  printf 'https://management.azure.com/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/containerApps/%s?api-version=%s'     "$SUBSCRIPTION_ID" "$RESOURCE_GROUP" "$1" "$CONTAINERAPP_API"
+}
+
+app_exists() { succeeds az containerapp show --name "$1" --resource-group "$RESOURCE_GROUP"; }
+
+app_fqdn() {
+  az containerapp show --name "$1" --resource-group "$RESOURCE_GROUP"     --query properties.configuration.ingress.fqdn -o tsv
+}
+
+# Applies a JSON merge patch (a file) to a container app and waits until Azure has
+# finished with it. Used for the template, which the CLI's flags do not cover fully.
+patch_app() { # patch_app <app name> <json file>
+  az rest --method patch --url "$(app_url "$1")" --body "@$(native_path "$2")"     --headers "Content-Type=application/json" --only-show-errors --output none
+  wait_for_app "$1"
+}
+
+wait_for_app() { # wait_for_app <app name>: until the last change is applied and ready
+  local state latest ready attempt
+  for attempt in $(seq 1 60); do
+    state="$(az containerapp show --name "$1" --resource-group "$RESOURCE_GROUP" --query properties.provisioningState -o tsv)"
+    latest="$(az containerapp show --name "$1" --resource-group "$RESOURCE_GROUP" --query properties.latestRevisionName -o tsv)"
+    ready="$(az containerapp show --name "$1" --resource-group "$RESOURCE_GROUP" --query properties.latestReadyRevisionName -o tsv)"
+    case "$state" in
+      Succeeded) if [ -n "$latest" ] && [ "$latest" = "$ready" ]; then info "$1: revision $latest is ready."; return 0; fi ;;
+      Failed | Canceled) die "$1: Azure reports the change as $state. See: az containerapp revision list --name $1 --resource-group $RESOURCE_GROUP -o table" ;;
+    esac
+    sleep 5
+  done
+  die "$1: the new revision is not ready after 5 minutes (latest: $latest, ready: $ready).
+See its logs: az containerapp logs show --name $1 --resource-group $RESOURCE_GROUP --tail 50"
+}
+
+# The application 02-entra.sh registered, found by its name. Not stored anywhere.
+entra_client_id() {
+  local found
+  found="$(az ad app list --display-name "$ENTRA_APP_NAME" --query "[?displayName=='$ENTRA_APP_NAME'].appId" -o tsv)"
+  [ "$(printf '%s' "$found" | grep -c . || true)" = "1" ]     || die "Expected exactly one app registration named '$ENTRA_APP_NAME'. Run 02-entra.sh."
+  printf '%s' "$found"
 }

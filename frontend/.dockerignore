@@ -1,0 +1,13 @@
+# The build needs the sources, package.json and the lock file. Everything else stays out,
+# first of all local configuration.
+.env
+.env.*
+node_modules/
+.next/
+out/
+tests/
+vitest.config.mts
+*.tsbuildinfo
+next-env.d.ts
+Dockerfile
+.dockerignore
