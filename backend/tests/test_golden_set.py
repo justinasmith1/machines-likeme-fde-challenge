@@ -2,6 +2,7 @@
 
 Inputs are real data and are not committed (data/ is git-ignored). See golden_harness.
 If the reference data or the extractions are missing the cases are skipped, never failed.
+Documents go through the production matching layer and the rules engine, in order.
 
 Each verified extraction uses ExtractedInvoice field names. Each line also carries
 po_line_reference, which is not part of the model and is read here for the line mapping.
@@ -18,17 +19,15 @@ from dataclasses import dataclass
 import pytest
 
 from app.domain.enums import InvoiceStatus
-from app.domain.models import ExtractedInvoice
-from app.extraction.pipeline import decide
-from app.extraction.service import ExtractionResult, ExtractionStatus
-from app.rules.engine import Decision, evaluate
-from app.rules.parameters import RuleParameters
+from app.db.invoice_tables import EvaluationRow
+from app.rules.engine import Decision
 from golden_harness import (
     EXTRACTIONS_DIR,
     GOLDEN,
     REFERENCE_DIR,
-    GoldenState,
-    line_mapping,
+    GoldenRunner,
+    extraction_from_verified_non_invoice,
+    mapped_from_verified,
     verified_extraction_path,
 )
 
@@ -39,15 +38,11 @@ class GoldenResult:
     decision: Decision | None  # None when the engine did not run
 
 
-def _engine_must_not_run(mapped):
-    raise AssertionError("a non-invoice document reached the rules engine")
-
-
 @pytest.fixture(scope="module")
 def golden_results() -> dict[str, GoldenResult]:
     """Process every document that has a verified extraction, in golden-set order."""
-    state = GoldenState.load()
-    if state is None:
+    runner = GoldenRunner.load()
+    if runner is None:
         pytest.skip(f"reference data not found in {REFERENCE_DIR} (data/ is git-ignored)")
     if not EXTRACTIONS_DIR.is_dir():
         pytest.skip(f"extractions not found in {EXTRACTIONS_DIR} (data/ is git-ignored)")
@@ -61,21 +56,17 @@ def golden_results() -> dict[str, GoldenResult]:
 
         document_type = raw.get("document_type", "invoice")
         if document_type != "invoice":
-            extraction_result = ExtractionResult(
-                status=ExtractionStatus.NOT_AN_INVOICE,
-                document_type=document_type,
-                classification_reason=raw.get("classification_reason"),
+            # Through the invoice service, as an uploaded document: it must be recorded
+            # as not an invoice, with no engine evaluation at all.
+            invoice = runner.submit_document(
+                extraction_from_verified_non_invoice(raw), case["filename"]
             )
-            outcome = decide(extraction_result, _engine_must_not_run, RuleParameters())
-            results[case["filename"]] = GoldenResult(outcome.status, outcome.decision)
+            evaluations = runner.session.query(EvaluationRow).filter_by(invoice_id=invoice.id).count()
+            assert evaluations == 0, "a non-invoice document reached the rules engine"
+            results[case["filename"]] = GoldenResult(InvoiceStatus(invoice.status), None)
             continue
 
-        invoice = ExtractedInvoice.model_validate(raw)
-        mapping = line_mapping(
-            invoice.po_number, [line.get("po_line_reference") for line in raw["lines"]]
-        )
-        decision = evaluate(invoice, state.build_context(invoice, mapping), RuleParameters())
-        state.record(invoice, mapping, decision)
+        decision, _ = runner.evaluate(mapped_from_verified(raw), case["filename"], payload=raw)
         results[case["filename"]] = GoldenResult(InvoiceStatus[decision.outcome.name], decision)
 
     return results

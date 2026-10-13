@@ -16,6 +16,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # "development" enables the X-Dev-User / X-Dev-Role headers. Any other value disables
+    # them and the API answers 401 until real authentication is configured (phase 6).
+    # The default is "production": with no configuration the system is closed, not open.
+    # For local development set APP_ENV=development in .env.
+    app_env: str = "production"
+    # The only browser origin allowed to call the API (CORS).
+    frontend_origin: str = "http://localhost:3000"
+
     # Azure OpenAI is optional so the app starts without it.
     # The key is a SecretStr: repr/str show '**********', never the value.
     azure_openai_endpoint: str | None = None
@@ -36,11 +44,23 @@ class Settings(BaseSettings):
     pdf_max_pages: int = 5
     max_upload_mb: int = 10
 
+    # Uploaded documents (phase 4). Local folder now; Azure Blob Storage in deployment.
+    uploads_dir: str = "data/uploads"
+
     @property
     def extraction_cache_path(self) -> Path:
         """Cache directory; a relative value is resolved against the repo root."""
-        path = Path(self.extraction_cache_dir)
-        return path if path.is_absolute() else REPO_ROOT / path
+        return _resolve(self.extraction_cache_dir)
+
+    @property
+    def uploads_path(self) -> Path:
+        """Uploads directory; a relative value is resolved against the repo root."""
+        return _resolve(self.uploads_dir)
+
+
+def _resolve(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 @lru_cache

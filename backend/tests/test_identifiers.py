@@ -1,10 +1,10 @@
 import pytest
 
-from app.domain.identifiers import normalize_tax_id
+from app.db.tables import SupplierRow
+from app.domain.identifiers import normalize_name, normalize_tax_id
 from app.extraction.mapper import to_engine_input
-from app.reference.schemas import Supplier
+from app.matching.matcher import resolve_supplier
 from extraction_builders import make_extraction
-from golden_harness import GoldenState
 
 MASTER = "AB556123456701"
 
@@ -64,26 +64,34 @@ def test_mapper_keeps_the_raw_value_and_adds_the_normalized_one():
     assert extraction.header.supplier_tax_id == "Tax ID: tax-b"
 
 
-def _state_with(tax_id: str) -> GoldenState:
-    supplier = Supplier(
-        supplier_id="SUP-002",
-        legal_name="Test Supplier B",
-        tax_id=tax_id,
-        default_currency="EUR",
-        status="active",
+def _add_supplier(session, tax_id: str) -> None:
+    session.add(
+        SupplierRow(
+            supplier_id="SUP-002",
+            legal_name="Test Supplier B",
+            tax_id=tax_id,
+            default_currency="EUR",
+            status="active",
+        )
     )
-    return GoldenState.from_records([supplier], [], [])
+    session.flush()
 
 
-def test_supplier_is_resolved_despite_label_and_format_differences():
-    state = _state_with("12-3456789")  # master keeps its own format
+def test_supplier_is_resolved_despite_label_and_format_differences(session):
+    _add_supplier(session, "12-3456789")  # master keeps its own format
     for extracted in ("Tax ID: 123456789", "12-3456789", "ein 12 3456789"):
-        mapped = to_engine_input(make_extraction(header={"supplier_tax_id": extracted}))
-        supplier = state.supplier_for(mapped.invoice)
+        supplier, method = resolve_supplier(session, extracted, None)
         assert supplier is not None and supplier.tax_id == "12-3456789"
+        assert method == "TAX_ID"
 
 
-def test_supplier_with_a_different_tax_id_is_not_resolved():
-    state = _state_with("12-3456789")
-    mapped = to_engine_input(make_extraction(header={"supplier_tax_id": "Tax ID: 12-3456780"}))
-    assert state.supplier_for(mapped.invoice) is None
+def test_supplier_with_a_different_tax_id_is_not_resolved(session):
+    _add_supplier(session, "12-3456789")
+    supplier, method = resolve_supplier(session, "Tax ID: 12-3456780", None)
+    assert supplier is None and method == "UNRESOLVED"
+
+
+def test_names_normalize_to_letters_and_digits_in_lower_case():
+    assert normalize_name("Example Trading S.A.") == normalize_name("example  trading sa") == "exampletradingsa"
+    assert normalize_name("Example Trading") != normalize_name("Example Traders")
+    assert normalize_name(None) is None and normalize_name(" . ") is None

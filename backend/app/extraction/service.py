@@ -42,6 +42,7 @@ class ExtractionResult:
     model: str | None = None  # deployment name
     structured_output: bool | None = None
     file_sha256: str | None = None
+    raw_response: dict | None = None  # model response as received; never contains the key
 
 
 class ExtractionClient(Protocol):
@@ -94,6 +95,7 @@ def extract(
                     extraction,
                     from_cache=True,
                     structured_output=entry.get("structured_output"),
+                    raw_response=entry.get("raw_response"),
                     **common,
                 )
 
@@ -135,5 +137,6 @@ def extract(
         call.extraction,
         tokens=call.usage,
         structured_output=call.structured_output,
+        raw_response=call.raw_response,
         **common,
     )

@@ -33,3 +33,18 @@ def normalize_tax_id(value: str | None) -> str | None:
     text = _LABEL_PREFIX.sub("", value, count=1)
     text = _SEPARATORS.sub("", text).upper()
     return text or None
+
+
+_NOT_ALPHANUMERIC = re.compile(r"[^0-9a-z]+")
+
+
+def normalize_name(value: str | None) -> str | None:
+    """Comparable form of a supplier name: lower case, letters and digits only.
+
+    "Example Trading S.A." and "example trading sa" compare equal. Matching on it is
+    exact; there is no fuzzy matching.
+    """
+    if value is None:
+        return None
+    text = _NOT_ALPHANUMERIC.sub("", value.casefold())
+    return text or None
