@@ -1,6 +1,8 @@
-"""Mapping of model output to engine input, and the step that decides whether the engine runs."""
+"""Mapping of model output to engine input. Whether the engine runs at all is decided by
+the invoice service (see test_services)."""
 
 from datetime import date
+from types import SimpleNamespace
 from decimal import Decimal
 
 import pytest
@@ -8,10 +10,8 @@ from pydantic import ValidationError
 
 from app.domain.enums import InvoiceStatus, Outcome
 from app.extraction.mapper import MULTIPLE_PO_REFERENCES, to_engine_input
-from app.extraction.pipeline import decide
-from app.extraction.service import ExtractionResult, ExtractionStatus, result_from_extraction
 from app.reference.schemas import PurchaseOrder, PurchaseOrderLine, Supplier
-from app.rules.engine import MatchingContext
+from app.rules.engine import MatchingContext, evaluate
 from app.rules.parameters import RuleParameters
 from extraction_builders import make_extraction, make_payload, not_read, read
 from rules_builders import NOW
@@ -70,8 +70,12 @@ def _context(mapped) -> MatchingContext:
 
 
 def _decide(**overrides):
-    result = result_from_extraction(make_extraction(**overrides))
-    return decide(result, _context, P)
+    """Map a model answer and run the engine on it, as the invoice service does."""
+    mapped = to_engine_input(make_extraction(**overrides))
+    decision = evaluate(mapped.invoice, _context(mapped), P)
+    return SimpleNamespace(
+        status=InvoiceStatus[decision.outcome.name], decision=decision, flags=list(mapped.flags)
+    )
 
 
 def _codes(outcome) -> list[str]:
@@ -219,37 +223,3 @@ def test_multiple_po_references_map_the_first_and_add_a_visible_flag():
     assert mapped.flags == [MULTIPLE_PO_REFERENCES]
     assert "PO-2026-0003" in mapped.notes[0]
     assert MULTIPLE_PO_REFERENCES in _decide(header=header).flags
-
-
-def _must_not_be_called(mapped):
-    raise AssertionError("the engine path must not run for this document")
-
-
-def test_quotation_ends_as_not_an_invoice_without_calling_the_engine():
-    result = result_from_extraction(
-        make_extraction(document_type="quotation", classification_reason="Titled Quotation.")
-    )
-    assert result.status is ExtractionStatus.NOT_AN_INVOICE
-    outcome = decide(result, _must_not_be_called, P)
-    assert outcome.status is InvoiceStatus.NOT_AN_INVOICE
-    assert outcome.decision is None
-    assert outcome.reason == "Received, not an invoice: quotation (Titled Quotation.)"
-
-
-@pytest.mark.parametrize("document_type", ["credit_note", "other"])
-def test_other_non_invoices_do_not_reach_the_engine(document_type):
-    result = result_from_extraction(make_extraction(document_type=document_type))
-    outcome = decide(result, _must_not_be_called, P)
-    assert outcome.status is InvoiceStatus.NOT_AN_INVOICE and outcome.decision is None
-
-
-def test_failed_extraction_does_not_reach_the_engine():
-    result = ExtractionResult(
-        status=ExtractionStatus.EXTRACTION_FAILED,
-        errors=["The file is empty."],
-        error_code="UNREADABLE_DOCUMENT",
-    )
-    outcome = decide(result, _must_not_be_called, P)
-    assert outcome.status is InvoiceStatus.EXTRACTION_FAILED
-    assert outcome.reason == "The file is empty."
-    assert outcome.decision is None

@@ -23,12 +23,18 @@ from app.db.session import init_db, make_engine, make_session_factory
 from app.domain.enums import ExtractionSource, InvoiceStatus
 from app.domain.identifiers import normalize_tax_id
 from app.domain.models import ExtractedInvoice
+from app.config import Settings
+from app.domain.enums import Role
 from app.extraction.mapper import MappedInvoice
+from app.extraction.schema import ModelExtraction
+from app.extraction.service import result_from_extraction
 from app.matching.matcher import MatchResult
 from app.reference.loader import GRNS_FILE, PURCHASE_ORDERS_FILE, SUPPLIERS_FILE, load_reference
 from app.rules.engine import Decision
 from app.rules.parameters import RuleParameters
+from app.services.common import User
 from app.services.evaluation import evaluate_and_store
+from app.services.invoices import InvoiceService
 
 REPO = Path(__file__).resolve().parents[2]
 REFERENCE_DIR = REPO / "data" / "reference"
@@ -61,6 +67,46 @@ def mapped_from_verified(raw: dict) -> MappedInvoice:
     )
 
 
+def extraction_from_verified_non_invoice(raw: dict) -> ModelExtraction:
+    """A hand-verified file for a document that is not an invoice, as a model answer."""
+
+    def field(value) -> dict:
+        status = "read" if value is not None else "absent"
+        return {"value": value, "status": status, "suggested_value": None}
+
+    return ModelExtraction.model_validate(
+        {
+            "document_type": raw["document_type"],
+            "classification_reason": raw.get("classification_reason") or "Not an invoice.",
+            "header": {
+                "supplier_name": raw.get("supplier_name"),
+                "supplier_tax_id": raw.get("supplier_tax_id"),
+                "invoice_number": field(raw.get("invoice_number")),
+                "invoice_date": field(raw.get("invoice_date")),
+                "due_date": raw.get("due_date"),
+                "po_references": {"values": [], "status": "absent", "suggested_values": []},
+                "currency": raw.get("currency"),
+                "subtotal": raw.get("subtotal"),
+                "tax_amount": raw.get("tax_amount"),
+                "total_amount": raw.get("total"),
+            },
+            "lines": [],
+        }
+    )
+
+
+class _MemoryFileStore:
+    def __init__(self) -> None:
+        self._files: dict[str, bytes] = {}
+
+    def save(self, sha256: str, extension: str, data: bytes) -> str:
+        self._files[sha256 + extension] = data
+        return sha256 + extension
+
+    def load(self, stored_path: str) -> bytes:
+        return self._files[stored_path]
+
+
 class GoldenRunner:
     """Evaluates documents one after another against a database holding the reference data."""
 
@@ -79,6 +125,21 @@ class GoldenRunner:
         session = make_session_factory(engine)()
         load_reference(REFERENCE_DIR, session)
         return cls(session)
+
+    def submit_document(self, extraction: ModelExtraction, filename: str) -> InvoiceRow:
+        """Send a document through the invoice service: submit, then extract and evaluate.
+
+        The extraction step returns the given model answer instead of calling the model.
+        """
+        service = InvoiceService(
+            self.session,
+            file_store=_MemoryFileStore(),
+            extractor=lambda file_bytes, name: result_from_extraction(extraction),
+            settings=Settings(_env_file=None),
+            clock=lambda: EVALUATED_AT,
+        )
+        invoice = service.submit_invoice(filename.encode(), filename, User("golden", Role.INTAKE))
+        return service.process_invoice(invoice.id)
 
     def evaluate(
         self, mapped: MappedInvoice, filename: str, payload: dict | None = None

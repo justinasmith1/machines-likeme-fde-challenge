@@ -19,15 +19,14 @@ from dataclasses import dataclass
 import pytest
 
 from app.domain.enums import InvoiceStatus
-from app.extraction.pipeline import decide
-from app.extraction.service import ExtractionResult, ExtractionStatus
+from app.db.invoice_tables import EvaluationRow
 from app.rules.engine import Decision
-from app.rules.parameters import RuleParameters
 from golden_harness import (
     EXTRACTIONS_DIR,
     GOLDEN,
     REFERENCE_DIR,
     GoldenRunner,
+    extraction_from_verified_non_invoice,
     mapped_from_verified,
     verified_extraction_path,
 )
@@ -37,10 +36,6 @@ from golden_harness import (
 class GoldenResult:
     status: InvoiceStatus
     decision: Decision | None  # None when the engine did not run
-
-
-def _engine_must_not_run(mapped):
-    raise AssertionError("a non-invoice document reached the rules engine")
 
 
 @pytest.fixture(scope="module")
@@ -61,13 +56,14 @@ def golden_results() -> dict[str, GoldenResult]:
 
         document_type = raw.get("document_type", "invoice")
         if document_type != "invoice":
-            extraction_result = ExtractionResult(
-                status=ExtractionStatus.NOT_AN_INVOICE,
-                document_type=document_type,
-                classification_reason=raw.get("classification_reason"),
+            # Through the invoice service, as an uploaded document: it must be recorded
+            # as not an invoice, with no engine evaluation at all.
+            invoice = runner.submit_document(
+                extraction_from_verified_non_invoice(raw), case["filename"]
             )
-            outcome = decide(extraction_result, _engine_must_not_run, RuleParameters())
-            results[case["filename"]] = GoldenResult(outcome.status, outcome.decision)
+            evaluations = runner.session.query(EvaluationRow).filter_by(invoice_id=invoice.id).count()
+            assert evaluations == 0, "a non-invoice document reached the rules engine"
+            results[case["filename"]] = GoldenResult(InvoiceStatus(invoice.status), None)
             continue
 
         decision, _ = runner.evaluate(mapped_from_verified(raw), case["filename"], payload=raw)
