@@ -2,16 +2,12 @@
 pure comparison logic and its refusal to start without credentials."""
 
 import importlib.util
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from app.config import Settings
-from app.extraction.mapper import to_engine_input
-from app.reference.schemas import PurchaseOrder, PurchaseOrderLine
 from extraction_builders import make_extraction, make_payload, not_read
-from golden_harness import GoldenState
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_extraction_eval.py"
 
@@ -98,45 +94,6 @@ def test_field_verified_as_illegible_must_be_reported_illegible(script):
     missed = script.compare_with_verified(make_extraction(), verified)
     assert missed["illegible_ok"] is False
     assert missed["illegible_checks"][0]["model_status"] == "read"
-
-
-def _state() -> GoldenState:
-    po = PurchaseOrder(
-        po_number="PO-2026-0002",
-        supplier_id="SUP-002",
-        po_date="2026-02-01",
-        currency="EUR",
-        status="open",
-        lines=[
-            PurchaseOrderLine(line_number=1, item_code="ITEM-8", description="Another item",
-                              quantity_ordered=Decimal("1"), unit_price=Decimal("1.00")),
-            PurchaseOrderLine(line_number=2, item_code="ITEM-9", description="Synthetic Test Item",
-                              quantity_ordered=Decimal("4"), unit_price=Decimal("25.00")),
-        ],
-    )
-    return GoldenState({}, {po.po_number: po}, {})
-
-
-def test_printed_po_line_reference_is_used_first(script):
-    mapping, sources = script.map_lines(_state(), to_engine_input(make_extraction()))
-    assert mapping == {1: ("PO-2026-0002", 1)}
-    assert sources == ["printed on document"]
-
-
-def test_line_without_printed_reference_falls_back_to_description(script):
-    line = make_payload()["lines"][0]
-    line["po_line_reference"] = None
-    mapping, sources = script.map_lines(_state(), to_engine_input(make_extraction(lines=[line])))
-    assert mapping == {1: ("PO-2026-0002", 2)}
-    assert sources == ["description match"]
-
-
-def test_line_with_no_match_stays_unmapped(script):
-    line = make_payload()["lines"][0]
-    line.update(po_line_reference=None, description="Something else")
-    mapping, sources = script.map_lines(_state(), to_engine_input(make_extraction(lines=[line])))
-    assert mapping == {1: None}
-    assert sources == ["unmapped"]
 
 
 def test_script_exits_with_a_clear_message_when_the_key_is_missing(script, monkeypatch, capsys):

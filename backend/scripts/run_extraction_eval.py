@@ -12,15 +12,15 @@ For each document in data/test-invoices/ it:
   1. extracts it (cache first; waits between real calls to respect the rate limit);
   2. compares the model output field by field with the hand-verified extraction in
      data/test-invoices/extracted/INV-XX.extracted.json;
-  3. runs the mapper and the rules engine and compares the result with the golden set.
+  3. runs the mapper, the matching layer and the rules engine, and compares the result
+     with the golden set.
 
 It prints a summary table and writes the detail to data/cache/eval_report.json.
 Everything it reads and writes is under data/, which is git-ignored.
 
-Line mapping: the model only reports a PO line when the document prints one (DL-38).
-Until the matching layer exists (phase 4), a line without a printed reference is mapped
-here by exact description match against the purchase order. The report says which source
-was used for each line.
+Matching runs through the production matching layer against an in-memory database
+loaded with the real reference data. The report says, per line, which mapping method was
+used (DL-15), and how the supplier was resolved.
 """
 
 import argparse
@@ -37,20 +37,16 @@ sys.path.insert(0, str(BACKEND / "tests"))
 from app.config import get_settings  # noqa: E402
 from app.domain.enums import InvoiceStatus  # noqa: E402
 from app.domain.identifiers import normalize_tax_id  # noqa: E402
-from app.domain.models import ExtractedInvoice  # noqa: E402
 from app.extraction.client import AzureExtractionClient, require_credentials  # noqa: E402
 from app.extraction.errors import MissingCredentials  # noqa: E402
 from app.extraction.mapper import to_engine_input  # noqa: E402
-from app.extraction.pipeline import decide  # noqa: E402
 from app.extraction.service import ExtractionStatus, extract  # noqa: E402
-from app.rules.engine import evaluate  # noqa: E402
-from app.rules.parameters import RuleParameters  # noqa: E402
 from golden_harness import (  # noqa: E402
     GOLDEN,
     INVOICES_DIR,
     REFERENCE_DIR,
-    GoldenState,
-    line_mapping,
+    GoldenRunner,
+    mapped_from_verified,
     verified_extraction_path,
 )
 
@@ -194,32 +190,10 @@ def compare_with_verified(extraction, verified: dict) -> dict:
     }
 
 
-def map_lines(state: GoldenState, mapped) -> tuple[dict, list[str]]:
-    """Line mapping for the engine: printed PO line first, then exact description match."""
-    po_number = mapped.invoice.po_number
-    po = state.purchase_orders.get(po_number) if po_number else None
-    references: list[int | None] = []
-    sources: list[str] = []
-    for line, printed in zip(mapped.invoice.lines, mapped.line_po_references):
-        if printed is not None:
-            references.append(printed)
-            sources.append("printed on document")
-            continue
-        match = None
-        if po is not None and line.description:
-            wanted = _normalise(line.description)
-            candidates = [ln.line_number for ln in po.lines if _normalise(ln.description) == wanted]
-            if len(candidates) == 1:
-                match = candidates[0]
-        references.append(match)
-        sources.append("description match" if match is not None else "unmapped")
-    return line_mapping(po_number, references), sources
-
-
 # ---- main
 
 
-def _feed_state_from_verified(state: GoldenState, filename: str) -> None:
+def _feed_state_from_verified(runner: GoldenRunner, filename: str) -> None:
     """Keep document order meaningful for documents that are not being evaluated now."""
     path = verified_extraction_path(filename)
     if not path.is_file():
@@ -227,13 +201,10 @@ def _feed_state_from_verified(state: GoldenState, filename: str) -> None:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("document_type", "invoice") != "invoice":
         return
-    invoice = ExtractedInvoice.model_validate(raw)
-    mapping = line_mapping(invoice.po_number, [ln.get("po_line_reference") for ln in raw["lines"]])
-    decision = evaluate(invoice, state.build_context(invoice, mapping), RuleParameters())
-    state.record(invoice, mapping, decision)
+    runner.evaluate(mapped_from_verified(raw), filename, payload=raw)
 
 
-def evaluate_document(case: dict, state: GoldenState, settings, client, use_cache: bool) -> dict:
+def evaluate_document(case: dict, runner: GoldenRunner, settings, client, use_cache: bool) -> dict:
     filename = case["filename"]
     report: dict = {"file": filename, "expected_outcome": case["expected_outcome"]}
     source = INVOICES_DIR / filename
@@ -270,26 +241,25 @@ def evaluate_document(case: dict, state: GoldenState, settings, client, use_cach
     else:
         report["note"] = "no hand-verified extraction to compare with"
 
-    mapping_sources: list[str] = []
-    mapping_holder: dict = {}
-
-    def build_context(mapped):
-        mapping, sources = map_lines(state, mapped)
-        mapping_holder["mapping"] = mapping
-        mapping_sources.extend(sources)
-        return state.build_context(mapped.invoice, mapping)
-
-    outcome = decide(result, build_context, RuleParameters())
-    if outcome.decision is not None:
-        state.record(outcome.mapped.invoice, mapping_holder["mapping"], outcome.decision)
-        report["reasons"] = [f"{r.code}: {r.message}" for r in outcome.decision.reasons]
-    report["status"] = outcome.status.value
-    report["flags"] = outcome.flags
-    report["line_mapping_sources"] = mapping_sources
-    if case["expected_outcome"] is None:
-        report["outcome_ok"] = outcome.status is InvoiceStatus.NOT_AN_INVOICE
+    if result.status is ExtractionStatus.NOT_AN_INVOICE:
+        # Not an invoice: recorded as such, the engine does not run (DL-16).
+        status = InvoiceStatus.NOT_AN_INVOICE.value
+        report["flags"] = []
     else:
-        report["outcome_ok"] = outcome.status.value == case["expected_outcome"]
+        mapped = to_engine_input(result.extraction)
+        decision, match = runner.evaluate(
+            mapped, filename, payload=result.extraction.model_dump(mode="json")
+        )
+        status = decision.outcome.value
+        report["reasons"] = [f"{r.code}: {r.message}" for r in decision.reasons]
+        report["flags"] = list(mapped.flags)
+        report["supplier_method"] = match.supplier_method
+        report["line_mapping_sources"] = [m.method for m in match.line_matches]
+    report["status"] = status
+    if case["expected_outcome"] is None:
+        report["outcome_ok"] = status == InvoiceStatus.NOT_AN_INVOICE.value
+    else:
+        report["outcome_ok"] = status == case["expected_outcome"]
     return report
 
 
@@ -364,8 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot run the evaluation: {exc}", file=sys.stderr)
         return 2
 
-    state = GoldenState.load()
-    if state is None:
+    runner = GoldenRunner.load()
+    if runner is None:
         print(f"Reference data not found in {REFERENCE_DIR}.", file=sys.stderr)
         return 2
 
@@ -379,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     last_model_call: float | None = None
     for case in GOLDEN:
         if case not in selected:
-            _feed_state_from_verified(state, case["filename"])
+            _feed_state_from_verified(runner, case["filename"])
             continue
         if last_model_call is not None:
             wait = args.min_interval - (time.monotonic() - last_model_call)
@@ -387,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Waiting {wait:.0f}s to respect the rate limit...")
                 time.sleep(wait)
         print(f"Processing {case['filename']}...")
-        report = evaluate_document(case, state, settings, client, use_cache=not args.no_cache)
+        report = evaluate_document(case, runner, settings, client, use_cache=not args.no_cache)
         if not report.get("from_cache") and "extraction_status" in report:
             last_model_call = time.monotonic()
         reports.append(report)
