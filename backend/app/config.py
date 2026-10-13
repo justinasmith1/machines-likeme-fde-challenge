@@ -16,6 +16,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # "development" enables the X-Dev-User / X-Dev-Role headers. Any other value disables
+    # them and the API answers 401 until real authentication is configured (phase 6).
+    # The default is "production": with no configuration the system is closed, not open.
+    # For local development set APP_ENV=development in .env.
+    app_env: str = "production"
+    # The only browser origin allowed to call the API (CORS).
+    frontend_origin: str = "http://localhost:3000"
+
     # Azure OpenAI is optional so the app starts without it.
     # The key is a SecretStr: repr/str show '**********', never the value.
     azure_openai_endpoint: str | None = None
