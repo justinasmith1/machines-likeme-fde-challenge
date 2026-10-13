@@ -1,6 +1,7 @@
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.db import invoice_tables  # noqa: F401  (registers the phase 4 tables on Base)
 from app.db.tables import Base
 
 
