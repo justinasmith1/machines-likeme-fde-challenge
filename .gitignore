@@ -19,3 +19,6 @@ data/test-invoices/*
 
 # Model responses and evaluation reports contain real invoice data
 data/cache/
+
+# Uploaded documents are real invoices
+data/uploads/

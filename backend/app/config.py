@@ -36,11 +36,23 @@ class Settings(BaseSettings):
     pdf_max_pages: int = 5
     max_upload_mb: int = 10
 
+    # Uploaded documents (phase 4). Local folder now; Azure Blob Storage in deployment.
+    uploads_dir: str = "data/uploads"
+
     @property
     def extraction_cache_path(self) -> Path:
         """Cache directory; a relative value is resolved against the repo root."""
-        path = Path(self.extraction_cache_dir)
-        return path if path.is_absolute() else REPO_ROOT / path
+        return _resolve(self.extraction_cache_dir)
+
+    @property
+    def uploads_path(self) -> Path:
+        """Uploads directory; a relative value is resolved against the repo root."""
+        return _resolve(self.uploads_dir)
+
+
+def _resolve(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 @lru_cache
