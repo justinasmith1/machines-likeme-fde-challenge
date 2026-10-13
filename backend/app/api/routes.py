@@ -55,13 +55,18 @@ def _is_reviewer(user: User) -> bool:
     return user.role in REVIEWERS
 
 
-def _reviewer_detail(service: InvoiceService, session: Session, invoice_id: int) -> dict:
+def _reviewer_detail(
+    service: InvoiceService, session: Session, invoice_id: int, user: User
+) -> dict:
     invoice = service.get_invoice(invoice_id)
     return serializers.invoice_for_reviewer(
         invoice,
         queries.extraction_versions(session, invoice_id),
         service.latest_evaluation(invoice_id),
         service.decisions(invoice_id),
+        service.allowed_actions(invoice_id, user),
+        queries.evaluations(session, invoice_id),
+        queries.supplier_names(session),
     )
 
 
@@ -69,8 +74,16 @@ def _reviewer_detail(service: InvoiceService, session: Session, invoice_id: int)
 
 
 @router.get("/me")
-def me(user: User = Depends(current_user)) -> dict:
-    return {"username": user.username, "role": user.role.value}
+def me(user: User = Depends(current_user), state: AppState = Depends(get_state)) -> dict:
+    """Who the caller is, and the upload limits a client should show before uploading."""
+    return {
+        "username": user.username,
+        "role": user.role.value,
+        "upload": {
+            "max_mb": state.settings.max_upload_mb,
+            "extensions": list(SUPPORTED_EXTENSIONS),
+        },
+    }
 
 
 # ---- invoices
@@ -121,7 +134,8 @@ def list_invoices(
         )
     invoices = queries.list_invoices(session, status)
     if _is_reviewer(user):
-        return {"invoices": [serializers.invoice_summary(i) for i in invoices]}
+        names = queries.supplier_names(session)
+        return {"invoices": [serializers.invoice_summary(i, names) for i in invoices]}
     return {
         "invoices": [
             serializers.invoice_for_intake(i, service.latest_evaluation(i.id)) for i in invoices
@@ -137,7 +151,7 @@ def get_invoice(
     session: Session = Depends(get_session),
 ) -> dict:
     if _is_reviewer(user):
-        return _reviewer_detail(service, session, invoice_id)
+        return _reviewer_detail(service, session, invoice_id, user)
     invoice = service.get_invoice(invoice_id)
     return serializers.invoice_for_intake(invoice, service.latest_evaluation(invoice_id))
 
@@ -195,7 +209,7 @@ def correct_extraction(
     session: Session = Depends(get_session),
 ) -> dict:
     service.correct_extraction(invoice_id, body.corrections, body.comment, user)
-    return _reviewer_detail(service, session, invoice_id)
+    return _reviewer_detail(service, session, invoice_id, user)
 
 
 @router.post("/invoices/{invoice_id}/decisions")
@@ -208,7 +222,7 @@ def decide(
     session: Session = Depends(get_session),
 ) -> dict:
     service.decide(invoice_id, body.decision, body.comment, user)
-    return _reviewer_detail(service, session, invoice_id)
+    return _reviewer_detail(service, session, invoice_id, user)
 
 
 @router.get("/review-queue")
@@ -216,7 +230,8 @@ def review_queue(
     user: User = Depends(require_roles(*REVIEWERS)),
     session: Session = Depends(get_session),
 ) -> dict:
-    return {"invoices": [serializers.invoice_summary(i) for i in queries.review_queue(session)]}
+    names = queries.supplier_names(session)
+    return {"invoices": [serializers.invoice_summary(i, names) for i in queries.review_queue(session)]}
 
 
 # ---- parameters

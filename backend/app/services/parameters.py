@@ -39,7 +39,8 @@ def _from_row(row: RuleParametersRow) -> RuleParameters:
         price_tolerance_pct=row.price_tolerance_pct,
         analyst_approval_limit=row.analyst_approval_limit,
         rounding_tolerance=row.rounding_tolerance,
-        enabled_assumption_rules=frozenset(row.enabled_assumption_rules),
+        # Versions stored before A6, A7 and A9 became fixed rules may still list them.
+        enabled_assumption_rules=frozenset(row.enabled_assumption_rules) & ALL_ASSUMPTION_RULES,
         version=row.version,
         changed_by=row.changed_by,
         changed_at=row.changed_at,
@@ -110,7 +111,8 @@ def update_parameters(
         invalid = sorted(set(rules) - ALL_ASSUMPTION_RULES)
         if invalid:
             raise ValidationError(
-                f"Not assumption rules: {', '.join(invalid)}. Spec rules cannot be switched."
+                f"Not assumption rules: {', '.join(invalid)}. Spec rules cannot be switched, "
+                "and neither can A6, A7 or A9, which are fixed rules."
             )
         new["enabled_assumption_rules"] = sorted(set(rules))
 

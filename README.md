@@ -6,7 +6,7 @@ Contoso receives supplier invoices. Each invoice is matched against its purchase
 
 Only invoice data extraction uses an LLM (Azure OpenAI). The rules engine is pure, deterministic Python with unit tests.
 
-Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), matching, persistence, audit trail and business services (phase 4A) and the HTTP API (phase 4B) are implemented. The frontend, real authentication and deployment are not implemented yet.
+Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), matching, persistence, audit trail, business services and the HTTP API (phase 4), and the web frontend for the three roles (phase 5) are implemented. Real authentication (Microsoft Entra ID) and deployment are not implemented yet.
 
 ## Architecture
 
@@ -26,6 +26,14 @@ backend/app/
   cli.py       command line entry points
 backend/scripts/
   run_extraction_eval.py   manual evaluation against the real model (not part of pytest)
+frontend/
+  app/         Next.js App Router pages: login, invoices, review queue, invoice detail, parameters
+  components/  screens and their parts
+  lib/auth/    the only module that knows who the user is (development login now, Entra ID in phase 6)
+  lib/api/     the only module that calls the backend: typed client and error codes
+  lib/proxy/   the frontend's own /api proxy to the backend, used when both share an origin
+  lib/invoices/ what to show to whom: navigation by role, decisions as listed by the API, status names
+  tests/       Vitest: modules, screens against an in-memory backend, optional check against a live one
 ```
 
 ## Setup and running locally
@@ -171,6 +179,8 @@ The method used for each line is stored with the evaluation and can be shown to 
 
 Every change of status writes a row in `audit_events`: who (or `system`), with which role, when, and the details. Examples: `INVOICE_SUBMITTED`, `EXTRACTION_SUCCEEDED`, `EXTRACTION_FAILED`, `CLASSIFIED_NOT_AN_INVOICE`, `INVOICE_EVALUATED`, `EXTRACTION_CORRECTED`, `HELD_AFTER_CORRECTION`, `HUMAN_DECISION_RECORDED`, `HUMAN_DECISION_SUPERSEDED`, `DECISION_DENIED`, `PARAMETERS_UPDATED`.
 
+Events carry what a person needs to read them without opening other records: a correction stores each field it changed with the value and reading status before and after, and an evaluation stores the code and message of every rule that fired.
+
 The table is append-only. The application refuses any update or delete of an audit event, whether made through an object or through a bulk statement, and a test verifies it (DL-52). In deployment the database user should additionally be granted only INSERT and SELECT on this table.
 
 For any invoice, the trail together with `extraction_versions`, `evaluations` and `human_decisions` answers: what was read from the document and by whom, which rules fired, with which parameters and which reference data, who decided what and why.
@@ -196,6 +206,7 @@ The status names do not say who decided, because the AP Manager uses them too. W
 - **A new decision replaces the previous one.** The previous decision stays in `human_decisions`, marked as superseded; nothing is deleted.
 - **Approval limit:** approving or overriding an invoice whose total is above the analyst approval limit in force requires the AP Manager, also when there was an earlier decision. An analyst who tries gets a clear permission error, and the attempt is written to the audit trail. Rejecting or requesting a credit note does not release payment and is not limited (DL-49).
 - **The engine's evaluation is never modified.** The decision records the previous status next to it.
+- **Advice does not block.** When no invoice line is matched to a purchase order, the decisions that release payment come with advice to correct the purchase order number first. The reviewer can still decide (DL-76).
 
 ### Corrections never approve payment
 
@@ -215,7 +226,7 @@ PENDING_EXTRACTION -> HELD_FOR_REVIEW -> (correction) HELD_FOR_REVIEW -> (approv
 
 The price tolerance, the analyst approval limit, the rounding tolerance and the list of enabled assumption rules are stored in `rule_parameters`, as versions. Only the AP Manager can change them, with a mandatory comment; a change adds a version and writes an audit event. The first version is seeded from configuration.
 
-A change affects only evaluations made after it. Each evaluation keeps a snapshot of the parameters it used, so an earlier decision can always be explained with the values that applied then (DL-11). Spec rules cannot be switched off; only assumption rules can (DL-27).
+A change affects only evaluations made after it. Each evaluation keeps a snapshot of the parameters it used, so an earlier decision can always be explained with the values that applied then (DL-11). Spec rules cannot be switched off, and neither can the fixed rules A6, A7 and A9 (DL-18, DL-35, DL-78); only the remaining assumption rules can: A1, A2, A3, A4, A5, A8 and A10 (DL-27). As a result, no combination of parameters pays an invoice whose quantity, unit price, purchase order number, invoice number or invoice date is missing or illegible.
 
 ## API
 
@@ -223,7 +234,7 @@ The API is a thin layer over the services: it authenticates the caller, validate
 
 | Method and path | Roles | What it does |
 |---|---|---|
-| `GET /api/me` | All | Current user and role. |
+| `GET /api/me` | All | Current user and role, and the upload limits (maximum size, accepted file types) for a client to show. |
 | `POST /api/invoices` | All | Upload a document (multipart field `file`). Answers `202` with the id and status `PENDING_EXTRACTION`; extraction and evaluation run in the background. |
 | `GET /api/invoices` | All | List, newest first. Optional `?status=`. |
 | `GET /api/invoices/{id}` | All | Detail. The content depends on the role (see below). |
@@ -238,7 +249,9 @@ The API is a thin layer over the services: it authenticates the caller, validate
 | `GET /api/parameters/history` | AP Manager | Every parameter version. |
 | `GET /health` | Open | Liveness check. |
 
-**What each role sees of an invoice.** Reviewers get the extracted data with the reading status of each field, suggestions labelled as suggestions, the PO line each invoice line was mapped to and the method used, the evaluation in force with every reason (code, message, SPEC or ASSUMPTION, decision log reference), the parameter snapshot, every human decision including superseded ones, and the list of extraction versions. Intake users get only the file name, the upload time, the status and the reasons in plain language: no rule codes, no parameters, no reviewer names or comments, no audit trail (DL-60).
+**What each role sees of an invoice.** Reviewers get the supplier's legal name from the master with its code, the extracted data with the reading status and the origin of each field (read by the model, or corrected by a named person, with what it was before), suggestions labelled as suggestions, the PO line each invoice line was mapped to and the method used, the evaluation in force with every reason (code, message, SPEC, CONFIRMED or ASSUMPTION, decision log reference), every earlier evaluation, the parameter snapshot, every human decision including superseded ones, the list of extraction versions, and `actions`: what this user may do with the invoice now. Intake users get only the file name, the upload time, the status and the reasons in plain language: no rule codes, no parameters, no reviewer names or comments, no audit trail (DL-60).
+
+**Allowed actions come from the API.** The reviewer detail includes `actions`, computed by the same service rules that enforce them: the decisions that apply to the invoice in its status, and for each one whether this user may take it (`allowed`), the role it requires, and a `notice` when the approval limit or an unreadable total puts it in the AP Manager's hands (DL-49). A decision can also carry a `warning`: advice that does not block it, such as releasing payment when no invoice line is matched to a purchase order (DL-76). It also says whether the data can be corrected and whether a failed extraction can be retried. A client shows what the API lists; it does not compare amounts or repeat the rules (DL-66).
 
 **Errors** are JSON with a stable code and a readable message: `{"error": {"code": "PERMISSION_DENIED", "message": "..."}}`.
 
@@ -303,6 +316,160 @@ An upload calls the model unless the same file was extracted before with the sam
 - **In-process background work.** Background tasks run inside the API process, with no queue. An unexpected error while processing marks the invoice `EXTRACTION_FAILED` (code `PROCESSING_ERROR`) so it can be retried. Only if the process itself stops mid-task does the invoice stay `PENDING_EXTRACTION`, and it is not resumed automatically (DL-59).
 - **SQLite.** Fine for one process. Several API processes writing at once need PostgreSQL or Azure SQL.
 
+## Frontend
+
+`frontend/` is a Next.js (App Router, TypeScript) application for the three roles. It is built with `output: "standalone"`, a self-contained server bundle meant for a container image.
+
+It has three runtime dependencies (`next`, `react`, `react-dom`) and no component, data-fetching or PDF library: the screens are tables and forms, styled with one plain CSS file, and the browser's own viewer shows the documents (DL-71).
+
+### Screens by role
+
+| Page | Intake | AP Analyst | AP Manager |
+|---|---|---|---|
+| `/login` | Development login: pick a user name and a role. Says it is for development only. | same | same |
+| `/invoices` | Upload, with the size and type limits. List of documents: file, upload time, status and plain-language reasons. | Upload. List of all invoices, with a status filter and a link to each. | same |
+| `/review` | – | Review queue, oldest first. | same |
+| `/invoices/{id}` | – | The original document, which stays in view on wide screens, next to the extracted data and the evaluation; then the invoice lines and the decision across the whole page; correcting from the extracted data panel; reading status of each field; lines with the PO line they were matched to and the method; the evaluation with every reason; decisions, corrections and retry; history of decisions, of evaluations and of extraction versions. | Same, plus the audit trail as a timeline. |
+| `/parameters` | – | Parameters in force, read only. | Edit with a mandatory comment, and the version history. |
+
+- **Status.** Every status has a readable name, a symbol and a colour, so colour is never the only signal. Each list row also says in a sentence what the status means.
+- **Polling.** While a document is `PENDING_EXTRACTION`, the list and the detail refresh every 3 seconds. They stop when nothing is pending or the tab is hidden (DL-68).
+- **Suggestions (DL-18).** A value the model suggested is shown in its own dashed box labelled "Suggestion", with a note that the rules engine does not use it. The value cell stays "No value read". The correction form does not pre-fill suggestions (DL-73).
+- **Corrections (DL-46).** The correction form says, before and after saving, that correcting does not approve payment. After a correction the page shows that the invoice is still held and that approving is a separate action, with its own comment.
+- **Decisions.** Only the decisions the API lists for this user and invoice are offered. One that needs the AP Manager is shown disabled to an analyst, with the API's own notice. A comment is required.
+- **Who set each value.** A field the model read is tagged "Read", "Illegible" or "Not on the document". A value typed by a person is tagged "Corrected by <user>" with what the field was before (for example "was illegible"), in its own style. It is never shown as "Read" (DL-75).
+- **History in one card.** Decisions, earlier evaluations and extraction versions share a "History" card, each as a part that folds, with the number of items in its title. A part with nothing in it is not shown: no decisions yet, or a single evaluation. The decisions start open when there are any. After a correction the evaluation in force may show no reasons at all; the earlier evaluations keep the result and the rules of each previous run, so a reviewer sees why the invoice was held in the first place.
+- **Advice when no purchase order is matched.** Next to "Approve for payment" the page shows the API's advice to correct the purchase order number first. The decision stays available (DL-76).
+- **Supplier.** The queue and the detail header show the legal name from the supplier master with its code in brackets.
+- **Layout of the invoice page.** It reads top to bottom in the order a reviewer works. First two columns: the document on the left, which on wide screens stays in view while the right column scrolls, and on the right the extracted header data and the rules evaluation. Then, across the whole page, the invoice lines (their six columns do not fit beside the document) and the decision. The history card comes last. On narrow screens everything stacks and nothing sticks.
+- **Correcting.** "Correct data" is a secondary button inside the extracted data panel, shown only when the API allows it. The form opens in that panel, beside the document, under the values that were read. Before anything is saved it says that saving a correction does not approve payment and that the invoice stays held until someone records a decision (DL-46); the notice after saving says it again.
+- **Held after a correction.** When the engine's result for the corrected data is Auto-Pay but the invoice is held, the evaluation says so under the result: "After a correction the invoice stays held until a person decides (DL-46)."
+- **Navigation follows where the person came from.** A link to an invoice carries the list it was opened from (`?from=review` or `?from=invoices`). The invoice page marks that item in the navigation and its link back goes there. Opened directly, no item is marked.
+- **Audit trail in plain language.** Each event reads as sentences: "Line 1 quantity: illegible → 24", the outcome by name, each rule with its message. Identifiers, versions and hashes stay on a smaller secondary line.
+- **Upload control.** Our own "Choose file" button and drop zone, in English, showing the name and size of the chosen file with an option to remove it. The browser's file input is still in the page underneath, visually hidden, so keyboard and screen reader users get the standard control.
+- **Look.** One stylesheet and no component library: a deep green as the main colour, soft neutral backgrounds, status colours that share lightness and saturation, tabular figures for amounts and codes, visible hover and focus states. The font is the system's own modern sans-serif; nothing is downloaded (DL-79).
+- **Loading, empty and error states** on every screen.
+
+### Identity is in one module
+
+Everything about who the user is goes through `lib/auth`: the current session, signing out, and the headers that authenticate a request. Screens and the API client use only that. In development the module keeps the chosen user and role in `sessionStorage` and adds the `X-Dev-User` and `X-Dev-Role` headers; only `lib/auth/dev.ts` and the login page know that. Phase 6 replaces the provider with Microsoft Entra ID without touching the screens (DL-65).
+
+Hiding a button is a convenience, not security. The API enforces every permission, and each screen handles a 403 even when the button should not have been there: the message is shown and the page stays usable.
+
+### Calling the API
+
+- **One client** (`lib/api/client.ts`). No screen calls `fetch`.
+- **Two ways to reach the API** (DL-63), chosen with `API_BASE_URL`:
+  - *Absolute* (`http://localhost:8000/api`, the default): the browser calls the API on its own origin, and the API's CORS setting must allow the frontend.
+  - *Relative* (`/api`): the browser talks only to the frontend's origin, and the frontend's own proxy forwards `/api/*` to the backend. No CORS is involved. This is the layout planned for deployment: one origin behind Azure's authentication, so the session cookie travels with no tokens, and the backend can stay private because only the frontend server needs to reach it.
+- **Both settings are read at runtime.** The root layout, a server component, reads `API_BASE_URL` when the server runs and hands it to the client; the proxy reads `API_PROXY_TARGET` on every request. One build, and one container image, works in every environment (DL-64, DL-74).
+- **Errors.** Every failed call becomes one error type carrying the API's stable code. The text shown is chosen by code: for `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_STATE`, `FILE_TOO_LARGE`, `VALIDATION_ERROR` and `UNSUPPORTED_DOCUMENT_TYPE` the API's message is shown, because it is written for the user; `UNAUTHENTICATED`, connection problems and anything unexpected get fixed text. Raw errors and stack traces are never shown.
+- **No secrets.** The frontend holds no key and never calls Azure OpenAI; only the backend does.
+
+### Going back to a view
+
+What a screen loads is kept in memory and shared between screens (stale-while-revalidate, DL-80). No library is used: it is one module, `lib/cache.ts`, and the loading hook in `lib/hooks.ts`.
+
+- **Shown at once, refreshed in the background.** Going back to a view shows what was loaded before and requests a fresh copy. The loading state appears only when nothing is cached. If the background request fails, the cached data stays on screen with the error.
+- **One key per thing loaded.** Each list filter, the review queue, each invoice, each audit trail, the parameters and their history have their own key. Screens that ask for the same key at the same time share one request.
+- **An action invalidates what it affects.** Uploading invalidates every list of invoices. Correcting, deciding or retrying invalidates the lists, the review queue and that invoice's audit trail, and stores the invoice as the API returned it. Saving parameters stores the new version and invalidates the history. A view that is off screen forgets its data, so its next visit loads; a view that is on screen requests it again without going blank. An answer that was requested before the action is dropped when it arrives.
+- **Nothing crosses from one person to another.** When the signed-in person or their role changes, including signing out, the cache is emptied and answers still on their way are dropped. This is done in the identity module, so it holds for any provider.
+- **The original document is not cached.** It is requested every time an invoice is opened, and released when the view closes.
+- **In memory only.** Nothing is written to the browser's storage; reloading the page starts empty.
+- **Polling is unchanged.** A list or an invoice with something still being processed keeps asking every few seconds.
+
+In development, React's Strict Mode (on by default in Next.js) mounts every component twice, so an effect that loads data runs twice. Loads that go through the cache are joined into one request. The document is not cached, so in development it is requested twice per visit; a production build requests it once.
+
+### The `/api` proxy
+
+`app/api/[...path]/route.ts` is a route handler that forwards every `/api/*` request to the backend. Its logic is in `lib/proxy/forward.ts`.
+
+- **Target read on every request.** `API_PROXY_TARGET` (default `http://localhost:8000`) is the backend's origin, without `/api`. Nothing about the backend is stored in the build.
+- **What is forwarded.** The method, the path, the query string and the body. The body is streamed through, not loaded into memory.
+- **Headers are an allow-list.** Only `Accept`, `Accept-Language`, `Content-Type` and the identity headers go to the backend. `Host`, hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, `Proxy-*`), cookies and `Authorization` are not forwarded. On the way back, hop-by-hop and CORS headers are dropped.
+- **Identity in one place.** One function, `identityHeaders`, decides which identity travels to the backend. Today it passes the development headers. Phase 6 changes that function to pass the identity Azure injects in front of the frontend; nothing else in the proxy changes.
+- **Upload limit.** A request whose `Content-Length` is above the upload limit is refused with `413 FILE_TOO_LARGE`, in the backend's error format, without sending the body anywhere. A body with no declared length is counted as it streams and cut off at the same point. The limit is `MAX_UPLOAD_MB` (default 10), the same setting the backend uses, plus 64 KB for the multipart envelope; a file just over the limit therefore reaches the backend, which measures the file itself and answers `413`.
+- **Backend not answering.** A connection failure or a 60-second timeout gives `502` with the stable code `BACKEND_UNAVAILABLE` and a plain message. The detail goes to the frontend's server log only.
+- **Everything else** comes back as the backend sent it: status, body and error codes.
+
+### Frontend tests
+
+```bash
+cd frontend
+npm test            # Vitest
+npm run typecheck   # TypeScript
+npm run build       # production build
+```
+
+- **Modules:** the API client (URLs, headers, each error code, uploads), the auth module, the rules for what each role is shown, the decisions offered from what the API lists, status names, the correction diff, and the `/api` proxy.
+- **Proxy:** the target read per request, method, path, query and body forwarded, the body as a stream, the header allow-list, the upload limit with and without a declared length, a backend that does not answer, and responses passed through unchanged.
+- **Screens:** the real screens against an in-memory backend that behaves like the API for the cases exercised: login, upload and polling, what intake sees, the invoice detail, a suggestion shown as a suggestion, decisions with and without a comment, a 403 and a 409 shown clearly, correction then approval as separate steps, the audit trail for the manager only, parameters.
+- **Details added after review in the browser:** a corrected value tagged with who corrected it and never as read, earlier evaluations kept visible, advice shown without disabling the decision, the supplier's name, the audit trail as sentences, the version list without the deployment name, and the upload control with its hidden native input.
+- **Cache:** shown at once on return with no loading state, background refresh, simultaneous requests joined (including Strict Mode's double mount), what each action invalidates, an answer from before an action dropped, the cache emptied on sign-out and on a change of role or person, the document requested on every visit and never stored, and polling still asking at its interval.
+- **Layout and navigation of the invoice page:** the order of the page (columns, lines, decision, history), the correction button and form inside the extracted data panel with the DL-46 text shown before saving, the history card without empty parts, with its counts and with what starts open, the document column as the one that sticks, the DL-46 note under the engine result only while a correction keeps the invoice held, and the navigation item marked for each origin and for none.
+- **Stylesheet:** WCAG contrast of every text and background pair, computed from the CSS variables; visible focus; and the styles that carry rules (a suggestion and a corrected value must not look like a value the model read).
+- **Against a running backend (optional).** `tests/live-api.test.ts` drives the same API client through the flow for the three roles. It is skipped unless `LIVE_API_URL` is set. Pointing it at the frontend (`LIVE_API_URL=http://localhost:3000/api`) exercises the `/api` proxy end to end.
+- **No browser end-to-end test** (DL-72). See the limitations below.
+
+## Running backend and frontend together
+
+Two terminals. The backend needs `APP_ENV=development` in `backend/.env` for the development login to work.
+
+```bash
+# Terminal 1: API on http://localhost:8000
+cd backend
+source .venv/Scripts/activate
+python -m app.cli load-reference --dir ../data/reference   # once
+uvicorn app.main:app --reload
+
+# Terminal 2: frontend on http://localhost:3000
+cd frontend
+npm install        # once
+npm run dev
+```
+
+Open http://localhost:3000, pick a user name and a role, and sign in.
+
+- **CORS** needs no change for local use: the API allows `FRONTEND_ORIGIN`, which defaults to `http://localhost:3000`, the frontend's default address. If the frontend runs elsewhere, set `FRONTEND_ORIGIN` in `backend/.env` to that origin.
+- **API address.** The frontend calls `http://localhost:8000/api` by default. To change it, set `API_BASE_URL` (see `frontend/.env.example`) before starting the frontend.
+- **Same origin, as in deployment.** Put the two settings in `frontend/.env.local` (git-ignored) and run `npm run dev`:
+
+  ```
+  API_BASE_URL=/api
+  API_PROXY_TARGET=http://localhost:8000
+  ```
+
+  The browser then calls only `http://localhost:3000`, and the frontend's proxy forwards `/api/*` to the backend. CORS plays no part in this mode.
+- **Windows with Git Bash: do not type `API_BASE_URL=/api` on the command line.** Git Bash rewrites a value that starts with `/` into a Windows path, so the frontend receives `C:/Program Files/Git/api` and every call fails. Use `frontend/.env.local` as above. If the variable has to be on the command line, prefix the command with `MSYS_NO_PATHCONV=1`. PowerShell, cmd and Linux shells are not affected.
+- **If sign-in is refused** with a message about `APP_ENV`, the backend is not in development mode.
+
+To run the production build locally:
+
+```bash
+cd frontend
+npm run build
+cp -r .next/static .next/standalone/.next/
+API_BASE_URL=http://localhost:8000/api node .next/standalone/server.js
+
+# or, same origin, with the same build: both settings are read when the server runs.
+# MSYS_NO_PATHCONV=1 is for Git Bash on Windows only (see the note above); a .env.local
+# file next to server.js works too.
+MSYS_NO_PATHCONV=1 API_BASE_URL=/api API_PROXY_TARGET=http://localhost:8000 node .next/standalone/server.js
+```
+
+### Frontend limitations
+
+- **No browser end-to-end test.** Nothing drives a real browser. The screens are tested against an in-memory backend, and the API client against a running backend on request, but layout, the embedded document viewer and real navigation are checked by hand (DL-72).
+- **The visual design is not tested as an image.** Contrast and the rule-carrying styles are checked from the CSS, but nothing compares screenshots; how a page looks is judged by eye.
+- **Cached data can be briefly out of date.** A view shown from the cache is as old as the last visit until its refresh arrives, usually well under a second. Changes made by someone else are seen only at that refresh: the cache is invalidated by this browser's own actions, not by other people's. The API decides on current data in every case, so an action on an out-of-date view is refused or applied correctly, never applied to old data.
+- **The supplier's name is the master's current one.** It is looked up when the page is requested, not stored with the invoice, so it follows later changes to the supplier master.
+- **Development login only.** Identity is not verified until phase 6.
+- **Document viewer.** It relies on the browser's built-in PDF and image viewers. A browser without an inline PDF viewer shows only the link to open the file.
+- **No pagination or search** in the lists.
+- **Polling, not push.** A status change appears within about 3 seconds while the page is open.
+- **Corrections cannot add or remove lines,** only change existing ones; the API has the same limit.
+- **The proxy's upload limit is configured separately** from the backend's (`MAX_UPLOAD_MB` in each). If they differ, the lower one applies.
+
 ## Configuration
 
 Read from environment variables / `.env` (see `.env.example`).
@@ -325,6 +492,9 @@ Read from environment variables / `.env` (see `.env.example`).
 | `PDF_MAX_PAGES` | `5` | Longer PDFs are rejected (DL-42) |
 | `MAX_UPLOAD_MB` | `10` | Larger files are rejected (DL-42) |
 | `UPLOADS_DIR` | `data/uploads` | Uploaded documents; relative paths resolve against the repo root (DL-44) |
+| `API_BASE_URL` (frontend) | `http://localhost:8000/api` | Read by the Next.js server at runtime. Absolute, or `/api` to go through the frontend's own origin (DL-63, DL-64) |
+| `API_PROXY_TARGET` (frontend) | `http://localhost:8000` | Backend origin that the frontend's proxy forwards `/api/*` to when `API_BASE_URL=/api`. Read on every request (DL-74) |
+| `MAX_UPLOAD_MB` (frontend) | `10` | Upload limit applied by the frontend's proxy. Use the same value as the backend |
 
 ## Security notes
 
@@ -337,6 +507,8 @@ Read from environment variables / `.env` (see `.env.example`).
 - Tests never reach the network: a test guard fails on any real connection.
 - The development login headers work only when `APP_ENV=development` is set explicitly. The default is `production`: with no configuration the API answers 401 to everything, until real authentication is configured (DL-55).
 - Intake users never receive rule codes, parameters, reviewer names or comments, or the audit trail (DL-60).
+- The frontend holds no secret and never calls the model. Its only setting is the address of the API.
+- The frontend's `/api` proxy forwards an allow-list of headers only: no cookies, no `Authorization`, no `Host`. In deployment the backend can be private, reachable only from the frontend server.
 
 ## Deployment
 
@@ -369,8 +541,8 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-15 | Mapping invoice line to PO line. | Assumption: first by item code, then by description; mapping is stored; no mapping means hold. | Store the mapping per line. Implemented in the matching layer (phase 4) in this order: PO line printed on the document, identical normalized description, item code contained in the description. A method counts only if it finds exactly one PO line. | open |
 | DL-16 | Documents that are not invoices (e.g. quotations). | Adopted: non-invoice documents are recorded with status NOT_AN_INVOICE before the engine runs, are never payable, and the intake user sees "received, not an invoice". Source: Recruitment reply, 12 Oct 2026. | Classifier before the engine (phase 3). | closed |
 | DL-17 | Rounding in totals. | Adopted: 0.01 tolerance on totals and lines. Larger mismatches hold under A5. Source: Recruitment reply, 12 Oct 2026. | Rule A5 in the engine, using `rounding_tolerance`. | closed |
-| DL-18 | Illegible field (quantity, price). | Adopted: illegible fields hold; the system never infers a value. Any suggested value must be labelled as a suggestion in the UI. Source: Recruitment reply, 12 Oct 2026. | Rule A6 in the engine, and a UI requirement for phase 5. | closed |
-| DL-19 | Illegible or partial PO number. | Assumption: hold; the PO is not guessed. | No fuzzy PO matching. | open |
+| DL-18 | Illegible field (quantity, price). | Adopted: illegible fields hold; the system never infers a value. Any suggested value must be labelled as a suggestion in the UI. Source: Recruitment reply, 12 Oct 2026. | Three fixed rules apply the principle: A6 (illegible quantity or unit price), A7 (illegible purchase order number) and A9 for an illegible invoice number or date (DL-78). In those cases the reason is tagged CONFIRMED with this entry as reference. The rules are always on, not part of `enabled_assumption_rules` and not in the parameters form. A9 also holds when the invoice number or date is absent; that case is an assumption and is tagged as one (DL-35). In the interface a suggestion is shown apart from the value and labelled, and a value typed by a person is tagged as corrected, never as read (DL-75). | closed |
+| DL-19 | Illegible or partial PO number. | Adopted: hold; the PO is not guessed. Covered by DL-18: illegible fields hold and the system never infers a value. Source: Recruitment reply, 12 Oct 2026. | No fuzzy PO matching. Rule A7 applies it as a fixed rule, tagged CONFIRMED with DL-18 as reference (DL-78). | closed |
 | DL-20 | VAT rate. | Assumption: arithmetic consistency is validated, not the rate. | No rate lookup. | open |
 | DL-21 | Invoiced quantity accumulated across valid invoices of the same PO. | Adopted: only quantities already approved for payment count toward cumulative checks. A held or rejected invoice reserves nothing. If the new invoice exceeds the remaining received quantity, the whole invoice is held. Source: Recruitment reply, 12 Oct 2026. | The matching layer must track approvals (phase 4); engine unchanged (rule A8 reads `already_invoiced_by_po_line`). | closed |
 | DL-22 | Real data not versioned in git. | Assumption: ignored via `.gitignore`; review later. | `data/reference/*.json` and `data/test-invoices/*` ignored. | open |
@@ -378,15 +550,15 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-24 | Reference data schema strictness. | Assumed: unknown fields are rejected, except Supplier.address, which is optional and stored. | A new field in the source files requires a schema change and a DL update. Referential checks run only against records that passed validation, so one root-cause error does not produce cascading errors. | open |
 | DL-25 | Duplicate invoice definition. | Assumed: any earlier invoice with the same supplier_id and invoice_number, regardless of its outcome, makes the later one a duplicate. | A duplicate is rejected even if the first copy was held. Depends on processing order (upload timestamp). | open |
 | DL-26 | Invoice date earlier than purchase order date. | Adopted: reject. | Rule R5, always enabled, not configurable. Source: challenge brief, section 7. | closed |
-| DL-27 | Spec rules versus candidate assumptions. | Adopted: the five rejection and three hold conditions in spec section 7 are always enabled. Every additional rule derived from a decision-log assumption is tagged ASSUMPTION, carries its DL reference, and can be disabled by the AP Manager through `enabled_assumption_rules`. | A reviewer invoice always produces the outcome the spec prescribes, and the extra checks are visible and reversible. | open |
+| DL-27 | Spec rules versus candidate assumptions. | Adopted: the five rejection and three hold conditions in spec section 7 are always enabled. Every additional rule derived from a decision-log assumption is tagged ASSUMPTION, carries its DL reference, and can be disabled by the AP Manager through `enabled_assumption_rules`. | A reviewer invoice always produces the outcome the spec prescribes, and the extra checks are visible and reversible. Exception: A6, A7 and A9 are fixed rules and not switchable (DL-18, DL-78). Their reasons are tagged CONFIRMED, except A9 for an absent invoice number or date, which is tagged ASSUMPTION (DL-35) and is fixed all the same. The switchable rules are A1, A2, A3, A4, A5, A8 and A10. | open |
 | DL-28 | All triggered rules are reported, not only the winning one. | Adopted: the engine evaluates every rule and applies precedence over the accumulated reasons. | An analyst sees every discrepancy on a held invoice in one pass. | open |
 | DL-29 | Quotations under the literal spec. | Adopted: a document with no purchase order reference is rejected under R1. Classifying it as "not an invoice" (DL-16) is a pre-engine step. If AP prefers that, removing the classifier leaves R1 as the fallback. | Both paths are supported and the engine needs no change. | open |
 | DL-30 | Zero unit price on the purchase order. | Assumed: the tolerance cannot be computed. An invoice price other than zero is a hold (H2). Equal zero prices do not hold. | Division by zero is never attempted. | open |
-| DL-31 | Illegible purchase order number versus absent purchase order number. | Assumed: an invoice with a printed but partially illegible PO number is not R1 (absent). It is held under A7 (DL-19). | Extraction must distinguish "no PO printed" from "PO partially illegible" (`po_number_illegible`). | open |
+| DL-31 | Illegible purchase order number versus absent purchase order number. | Assumed: an invoice with a printed but partially illegible PO number is not R1 (absent). It is held under A7, which is a fixed rule (DL-18, DL-78). | Extraction must distinguish "no PO printed" from "PO partially illegible" (`po_number_illegible`). Either way the invoice is never paid automatically: an absent number is rejected by R1, an illegible one is held by A7, and neither rule can be switched off. | open |
 | DL-32 | Line mapping when the purchase order cannot be determined. | Assumed: H3 is not evaluated when the invoice has no determinable PO (absent, illegible, or missing from the master). The PO-level rule already applies. | Avoids duplicate reasons on the same invoice. | open |
 | DL-33 | Cumulative quantity check (A8) when the line alone is within received. | Assumed: A8 is reported only when the current line alone does not exceed received (H1 covers that case), so the same discrepancy is not reported twice. | The reason list has no duplicates. | open |
 | DL-34 | Invoice supplier not resolved to the supplier master. | Assumed: when the invoice supplier cannot be matched to the master and a PO is referenced, R3 applies (reject). | The matching layer (phase 4) must report an unresolved supplier as None, not guess. | open |
-| DL-35 | Missing or unreadable invoice number or invoice date. | Assumed: hold. The duplicate check (R4) and the date check (R5) cannot be evaluated, and the system does not infer the value. | Rule A9 (ASSUMPTION, holds), one reason per missing field. Disableable through `enabled_assumption_rules` without a code change. | open |
+| DL-35 | Missing or unreadable invoice number or invoice date. | Hold, in both cases. Illegible: covered by the principle the client confirmed in DL-18. Absent: assumed, not confirmed by the client. Without the invoice number or date the duplicate check (R4) or the date check (R5) cannot be evaluated, and paying without those checks contradicts the spec. The system does not infer the value. | Rule A9 holds, one reason per missing field. It is a fixed rule in both cases (DL-78): always on and not part of `enabled_assumption_rules`. The engine receives the reading status of the two fields (`invoice_number_illegible`, `invoice_date_illegible`), so the reason carries its real origin: CONFIRMED with DL-18 as reference when the field is illegible, ASSUMPTION with this entry as reference when it is absent. Tests cover both cases against every combination of parameters: none reaches Auto-Pay. | open |
 | DL-36 | Held invoices approved later by a human. | Adopted: an invoice that was held and is later approved for payment by an AP Analyst or AP Manager reserves its quantities from that moment, exactly like an AUTO_PAY invoice. Rejected invoices and invoices still held reserve nothing. | The matching layer (phase 4) must count AUTO_PAY plus human-approved invoices; the engine is unchanged; current tests only count AUTO_PAY because human approval does not exist yet. | open |
 | DL-37 | Multiple PO references on one invoice. | Adopted (candidate decision): an invoice that references more than one purchase order is always held, so that an analyst confirms how it splits across the orders. | Rule A10 (ASSUMPTION, holds), switchable through `enabled_assumption_rules`. The mapper keeps the full list of PO references and a `MULTIPLE_PO_REFERENCES` flag; the matching layer looks up every referenced order. | closed |
 | DL-38 | Division of work between the model and the code. | Assumed: the model classifies and transcribes; it never computes, corrects or maps lines to the purchase order. | Line-to-PO mapping is deterministic code (phase 4). The model reports a PO line number only when the document prints one. | open |
@@ -413,3 +585,22 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-59 | Background processing. | Assumed: extraction and evaluation run in an in-process background task after the upload answers, with a database session of their own. An unexpected error while processing marks the invoice EXTRACTION_FAILED with code PROCESSING_ERROR and a plain message, writes an audit event, and the invoice can be retried like any other failure. | The error detail goes to the server log only; nothing internal is stored or shown. Whatever the failed attempt had written is rolled back. No queue: if the process itself stops mid-task the invoice stays PENDING_EXTRACTION and is not resumed. A durable queue is a deployment decision. | open |
 | DL-60 | What intake users see. | Assumed: every invoice, not only their own uploads, limited to file name, upload time, status and plain-language reasons. Reviewer names and comments are not shown. Reason: the brief says the intake user can view the status of each submitted invoice, without restricting it to their own; intake is treated as a shared team inbox. | Rule reasons are shown as written by the engine, which includes PO prices and quantities. Restricting intake users to their own uploads would need a filter by uploader. | open |
 | DL-61 | Upload checks at the API. | Assumed: an unsupported file type or an empty file is refused at upload (422), and a file over the limit with 413, instead of being registered and failing extraction. | Only readable documents become invoices. A corrupt PDF or image is still detected at extraction and can be retried. | open |
+| DL-62 | Language of the interface. | Assumed: English, like the code, the rule messages and the brief. | Status names, labels and error text are in plain English. | open |
+| DL-63 | How the frontend reaches the API. | Assumed: two modes, chosen with `API_BASE_URL`. Absolute: the browser calls the API directly, with CORS limited to the frontend origin. Relative (`/api`): the browser talks only to the frontend's origin and the frontend's own proxy forwards `/api/*` to the backend. The relative mode is the layout planned for deployment: one origin behind Azure's authentication, so the session cookie travels with no tokens and no CORS. | The API client accepts both forms and no screen knows which is in use. The absolute mode stays the default for local development. | open |
+| DL-64 | When the API address is fixed. | Assumed: `API_BASE_URL` is read at runtime. The Next.js server reads it on each request and passes it to the browser code. | One build works with an absolute or a relative base; pages are rendered on demand, not prebuilt. The proxy target is also read at runtime (DL-74). | open |
+| DL-65 | Identity in the frontend. | Assumed: one module, `lib/auth`, is the only place that knows who the user is. In development it keeps the chosen user and role in `sessionStorage` and sends the `X-Dev-*` headers. | Convenience, not security: the login screen and a banner on every page say so. Phase 6 replaces the provider with Entra ID; screens and the API client do not change. | open |
+| DL-66 | Who decides which actions a reviewer can take. | Assumed: the API. The invoice detail lists the decisions that apply for this user, whether each is allowed, the role required, and a notice when the approval limit or an unreadable total requires the AP Manager. The same service rules enforce them. | The frontend shows what the API lists and never compares a total with the limit. A test checks that what is listed and what is accepted never disagree. Hiding a button stays a convenience: the API still checks. The API can also attach advice (`warning`) to a decision without blocking it (DL-76). | open |
+| DL-67 | Where upload limits shown to the user come from. | Assumed: from the API (`GET /api/me`), which reads the same settings it enforces. | The limits shown cannot drift from the limits applied. The frontend also checks type and size before sending, to answer at once. | open |
+| DL-68 | How the screens learn of a status change. | Assumed: polling every 3 seconds, only while a document is `PENDING_EXTRACTION` and the tab is visible. | No websockets or server-sent events. An idle page makes no requests. | open |
+| DL-69 | How the original document is shown. | Assumed: with the browser's own PDF and image viewers, from a blob fetched through the API client. | No PDF library. The document endpoint needs the caller's identity, which a plain `src` attribute cannot send. | open |
+| DL-70 | What the intake screens offer. | Assumed: upload and the list with status and plain reasons, which is everything the intake view of the API returns. No detail page, and no retry: the API reserves retry for reviewers. | A failed document tells the intake user that Accounts Payable can retry it. | open |
+| DL-71 | Frontend dependencies. | Assumed: Next.js and React only at runtime; no component, data-fetching or form library. | Plain CSS and small hooks for loading and polling. Fewer packages to audit and update. | open |
+| DL-72 | Browser end-to-end tests. | Assumed: none (no Playwright). A real-browser test needs a running backend with real documents and extractions, which are not in the repository, so it could not run on a fresh clone; it also adds a browser download of more than 100 MB. | Covered instead by screen tests against an in-memory backend, an optional check of the API client against a running backend, and a manual pass per role. Layout and real navigation are not tested automatically. | open |
+| DL-73 | Suggested values in the correction form. | Assumed: never pre-filled. The reviewer types a value only if they can read it on the document. | A suggestion cannot become data by pressing Save. Follows DL-18. | open |
+| DL-74 | How the frontend forwards `/api` to the backend. | Assumed: with its own proxy, a route handler that reads `API_PROXY_TARGET` on every request. A `next.config.ts` rewrite was tried first and dropped: Next.js stores a rewrite's destination in the build output, so the target could not change without rebuilding, and its proxy cut request bodies off at 10 MB. Verified by starting one build against different backend addresses. | One image for every environment, and the backend can be private: only the frontend server reaches it. The proxy forwards an allow-list of headers, streams bodies, refuses oversized uploads with the backend's own 413, and answers 502 `BACKEND_UNAVAILABLE` when the backend does not respond. Identity is passed on by one function, which phase 6 changes to the identity Azure injects. | open |
+| DL-75 | Showing who set each value. | Assumed: the invoice detail gives the origin of every field. A field the model read shows its reading status. A field a person corrected shows who corrected it and what it was before, and is never presented as read by the model. | The API computes the origin from the extraction versions; a correction's audit event stores each change with its value and status before and after. | open |
+| DL-76 | Releasing payment when no purchase order is matched. | Assumed: when none of the invoice's lines is matched to a purchase order line, the decisions that release payment carry advice to correct the purchase order number first. It is advice, not a block: the reviewer can still approve or override, with the mandatory comment. | The advice is computed by the service and shown as it comes; rejecting or requesting a credit note does not carry it. | open |
+| DL-77 | Where the supplier's displayed name comes from. | Assumed: the legal name in the supplier master as it is loaded now, shown with the supplier code. | It is not stored with the invoice: it follows later changes to the master, and is empty if the supplier was not resolved or is no longer in the master. The supplier code is what the evaluation keeps. | open |
+| DL-78 | Switching off A7 or A9. | Decided: A7 and A9 are fixed rules, like A6. DL-18 confirms the general principle ("illegible fields hold; the system never infers a value"), which covers an illegible purchase order number (A7) and an illegible invoice number or date (A9). For an absent invoice number or date A9 is fixed as well: without them R4 and R5 cannot be evaluated, and paying without those checks contradicts the spec. Before this, switching A7 or A9 off let such an invoice reach Auto-Pay. | A7 and A9 always run and were removed from `enabled_assumption_rules` and from the parameters form; a request to switch them is refused, and a stored parameter version that lists them is read without them. Tests evaluate every subset of the switchable rules with several tolerances and limits: none pays an invoice with a missing or illegible purchase order number, invoice number, invoice date, quantity or unit price. A7, and A9 for an illegible field, are tagged CONFIRMED with DL-18 as reference; A9 for an absent field is tagged ASSUMPTION with DL-35 as reference. | closed |
+| DL-79 | Visual design and fonts. | Assumed: one stylesheet with CSS variables, no component library, and the operating system's modern sans-serif font rather than a downloaded one. | No font files or third-party requests; the build needs no network for fonts. The exact typeface differs between Windows, macOS and Linux. | open |
+| DL-80 | Loading data again when going back to a view. | Assumed: stale-while-revalidate in the frontend, written in the project with no library. A view shows at once what it loaded before and refreshes it in the background; simultaneous requests for the same data are joined; an action that changes data invalidates what it affects; the cache is emptied when the person or the role changes; the original document is not cached. | The cache is in memory for the life of the page and nothing is stored in the browser. A view can show data as old as its last visit until the refresh arrives, and it does not learn of other people's changes before that. The API remains the authority: it validates every action against current data. | open |

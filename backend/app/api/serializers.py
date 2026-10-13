@@ -19,6 +19,7 @@ from app.db.invoice_tables import (
 )
 from app.domain.enums import InvoiceStatus
 from app.rules.parameters import RuleParameters
+from app.services.corrections import diff_extractions
 
 SUGGESTION_NOTE = "Suggested by the model. It is not a value read from the document and the rules engine does not use it."
 
@@ -69,7 +70,7 @@ def invoice_for_intake(invoice: InvoiceRow, evaluation: EvaluationRow | None) ->
 # ---- reviewer view
 
 
-def invoice_summary(invoice: InvoiceRow) -> dict:
+def invoice_summary(invoice: InvoiceRow, supplier_names: dict[str, str] | None = None) -> dict:
     return {
         "id": invoice.id,
         "filename": invoice.filename,
@@ -78,37 +79,81 @@ def invoice_summary(invoice: InvoiceRow) -> dict:
         "status": invoice.status,
         "status_reason": invoice.status_reason,
         "supplier_id": invoice.supplier_id,
+        # Legal name from the supplier master; None if the supplier is unresolved or the
+        # master no longer has it.
+        "supplier_name": (supplier_names or {}).get(invoice.supplier_id) if invoice.supplier_id else None,
         "invoice_number": invoice.invoice_number,
         "total": _amount(invoice.total),
         "currency": invoice.currency,
     }
 
 
-def _read_field(field: dict) -> dict:
-    """A field with its reading status. A suggestion is kept apart and labelled."""
+MODEL_ORIGIN = {"source": "MODEL"}
+
+
+def field_origins(versions: list[ExtractionVersionRow]) -> dict[tuple, dict]:
+    """Who last set each field: the model, or a person in a correction.
+
+    Keyed by (scope, line_number, field). Fields not in the result came from the model.
+    For a corrected field it says who corrected it and what the field was before, so a
+    value typed by a person is never shown as if the model had read it.
+    """
+    origins: dict[tuple, dict] = {}
+    for before, after in zip(versions, versions[1:]):
+        for change in diff_extractions(before.payload, after.payload):
+            key = (change["scope"], change["line_number"], change["field"])
+            if after.source != "HUMAN_CORRECTION":
+                origins.pop(key, None)  # the model read it again
+                continue
+            origins[key] = {
+                "source": "HUMAN_CORRECTION",
+                "corrected_by": after.created_by,
+                "corrected_at": _time(after.created_at),
+                "version": after.version,
+                "previous_value": change["before"]["value"],
+                "previous_status": change["before"]["status"],
+            }
+    return origins
+
+
+def _read_field(field: dict, origin: dict | None = None) -> dict:
+    """A field with its reading status and origin. A suggestion is kept apart and labelled."""
     suggested = field.get("suggested_value")
     return {
         "value": field.get("value"),
         "status": field.get("status"),
+        "origin": origin or MODEL_ORIGIN,
         "suggestion": None
         if suggested is None
         else {"value": suggested, "is_suggestion": True, "note": SUGGESTION_NOTE},
     }
 
 
-def _po_references(field: dict) -> dict:
+def _po_references(field: dict, origin: dict | None = None) -> dict:
     suggested = field.get("suggested_values") or []
     return {
         "values": field.get("values", []),
         "status": field.get("status"),
+        "origin": origin or MODEL_ORIGIN,
         "suggestion": None
         if not suggested
         else {"values": suggested, "is_suggestion": True, "note": SUGGESTION_NOTE},
     }
 
 
-def extraction_detail(version: ExtractionVersionRow, evaluation: EvaluationRow | None) -> dict:
+def extraction_detail(
+    version: ExtractionVersionRow,
+    evaluation: EvaluationRow | None,
+    origins: dict[tuple, dict] | None = None,
+) -> dict:
     payload = version.payload
+    origins = origins or {}
+
+    def plain_origins(scope: str, line_number: int | None, names: tuple[str, ...]) -> dict:
+        """Origins of the fields without a reading status, only where a person set them."""
+        found = {name: origins.get((scope, line_number, name)) for name in names}
+        return {name: origin for name, origin in found.items() if origin}
+
     header = payload.get("header")
     if not isinstance(header, dict):
         return {**version_summary(version), "data": payload}  # not in the model's format
@@ -124,10 +169,15 @@ def extraction_detail(version: ExtractionVersionRow, evaluation: EvaluationRow |
             {
                 "line_number": number,
                 "description": line.get("description"),
-                "quantity": _read_field(line.get("quantity") or {}),
-                "unit_price": _read_field(line.get("unit_price") or {}),
+                "quantity": _read_field(line.get("quantity") or {}, origins.get(("line", number, "quantity"))),
+                "unit_price": _read_field(
+                    line.get("unit_price") or {}, origins.get(("line", number, "unit_price"))
+                ),
                 "line_total": line.get("line_total"),
                 "po_line_printed_on_document": line.get("po_line_reference"),
+                "corrected_fields": plain_origins(
+                    "line", number, ("description", "line_total", "po_line_reference")
+                ),
                 "po_line_mapping": None
                 if matched is None
                 else {
@@ -141,13 +191,28 @@ def extraction_detail(version: ExtractionVersionRow, evaluation: EvaluationRow |
         **version_summary(version),
         "document_type": payload.get("document_type"),
         "classification_reason": payload.get("classification_reason"),
+        # Fields without a reading status that a person corrected, with who and what it was.
+        "corrected_fields": {
+            **plain_origins("document", None, ("document_type",)),
+            **plain_origins(
+                "header",
+                None,
+                ("supplier_name", "supplier_tax_id", "due_date", "currency", "subtotal", "tax_amount", "total_amount"),
+            ),
+        },
         "header": {
             "supplier_name": header.get("supplier_name"),
             "supplier_tax_id": header.get("supplier_tax_id"),
-            "invoice_number": _read_field(header.get("invoice_number") or {}),
-            "invoice_date": _read_field(header.get("invoice_date") or {}),
+            "invoice_number": _read_field(
+                header.get("invoice_number") or {}, origins.get(("header", None, "invoice_number"))
+            ),
+            "invoice_date": _read_field(
+                header.get("invoice_date") or {}, origins.get(("header", None, "invoice_date"))
+            ),
             "due_date": header.get("due_date"),
-            "po_references": _po_references(header.get("po_references") or {}),
+            "po_references": _po_references(
+                header.get("po_references") or {}, origins.get(("header", None, "po_references"))
+            ),
             "currency": header.get("currency"),
             "subtotal": header.get("subtotal"),
             "tax_amount": header.get("tax_amount"),
@@ -169,10 +234,12 @@ def version_summary(version: ExtractionVersionRow) -> dict:
     }
 
 
-def evaluation_detail(evaluation: EvaluationRow) -> dict:
+def evaluation_detail(evaluation: EvaluationRow, version_numbers: dict[int, int] | None = None) -> dict:
     matching = evaluation.matching
     return {
         "id": evaluation.id,
+        # Which extraction version this run of the engine looked at.
+        "extraction_version": (version_numbers or {}).get(evaluation.extraction_version_id),
         "outcome": evaluation.outcome,
         "evaluated_at": _time(evaluation.evaluated_at),
         "reasons": evaluation.reasons,  # code, message, outcome, source, decision_log_ref, line_number
@@ -209,12 +276,23 @@ def invoice_for_reviewer(
     versions: list[ExtractionVersionRow],
     evaluation: EvaluationRow | None,
     decisions: list[HumanDecisionRow],
+    actions: dict,
+    evaluations: list[EvaluationRow] | None = None,
+    supplier_names: dict[str, str] | None = None,
 ) -> dict:
     latest = versions[-1] if versions else None
+    version_numbers = {version.id: version.version for version in versions}
     return {
-        "invoice": invoice_summary(invoice),
-        "extraction": extraction_detail(latest, evaluation) if latest else None,
-        "evaluation": evaluation_detail(evaluation) if evaluation else None,
+        "invoice": invoice_summary(invoice, supplier_names),
+        # What the caller may do now, computed by the service for their role.
+        "actions": actions,
+        "extraction": extraction_detail(latest, evaluation, field_origins(versions)) if latest else None,
+        "evaluation": evaluation_detail(evaluation, version_numbers) if evaluation else None,
+        # Every run of the rules engine, oldest first; the last one is the one in force.
+        # Earlier runs show why the invoice was held or rejected before a correction.
+        "evaluation_history": [
+            evaluation_detail(item, version_numbers) for item in (evaluations or [])
+        ],
         "decisions": [decision_detail(d) for d in decisions],
         "extraction_versions": [version_summary(v) for v in versions],
     }

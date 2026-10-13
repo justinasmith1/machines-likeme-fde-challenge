@@ -42,6 +42,11 @@ class ExtractedInvoice(BaseModel):
     supplier_tax_id: str | None = None
     invoice_number: str | None = None
     invoice_date: date | None = None
+    # True when the field is printed but could not be read, as opposed to not being on
+    # the document. Both hold the invoice under A9; only the origin of the rule differs
+    # (illegible: DL-18, confirmed by the client; absent: DL-35, an assumption).
+    invoice_number_illegible: bool = False
+    invoice_date_illegible: bool = False
     po_number: str | None = None
     # True when the PO number is printed but partially illegible (DL-19, DL-31).
     # Distinguishes "illegible" (A7, hold) from "no PO referenced" (R1, reject).

@@ -4,7 +4,13 @@ Pure: no database, no network, no global clock, no LLM. Same input, same Decisio
 
 Precedence (spec section 7, DL-28):
   1. REJECTED: any rejection rule (R1-R5 from the spec, A2 assumption) rejects.
-  2. HELD_FOR_REVIEW: otherwise, any hold rule (H1-H3 from the spec, A1 and A3-A10 assumptions).
+  2. HELD_FOR_REVIEW: otherwise, any hold rule (H1-H3 from the spec; the fixed rules A6,
+     A7 and A9; the switchable assumptions A1, A3-A5, A8 and A10).
+
+Missing or illegible data never reaches AUTO_PAY, whatever the parameters: a quantity,
+unit price, purchase order number, invoice number or invoice date that could not be read
+holds the invoice under a fixed rule (A6, A7, A9; DL-18, DL-35), and an invoice with no purchase
+order at all is rejected (R1).
   3. AUTO_PAY: the default when no rule fires.
 
 Every rule is evaluated and every triggered rule is reported. Precedence only decides
@@ -25,8 +31,9 @@ from app.rules.parameters import RuleParameters
 
 
 class RuleSource(StrEnum):
-    SPEC = "SPEC"
-    ASSUMPTION = "ASSUMPTION"
+    SPEC = "SPEC"  # from the brief; always on
+    CONFIRMED = "CONFIRMED"  # confirmed by the client; always on
+    ASSUMPTION = "ASSUMPTION"  # candidate assumption; can be switched off
 
 
 @dataclass(frozen=True)
@@ -199,28 +206,32 @@ def evaluate(
                 )
             )
 
-    # A9: invoice number or date missing, so R4 / R5 cannot be evaluated (DL-35).
-    if "A9" in enabled:
-        for value, message in (
-            (
-                invoice.invoice_number,
-                "Invoice number is missing or unreadable; duplicate check cannot be performed",
-            ),
-            (
-                invoice.invoice_date,
-                "Invoice date is missing or unreadable; date check cannot be performed",
-            ),
-        ):
-            if not value:
-                reasons.append(
-                    _reason(
-                        "A9",
-                        message,
-                        Outcome.HELD_FOR_REVIEW,
-                        source=RuleSource.ASSUMPTION,
-                        decision_log_ref="DL-35",
-                    )
+    # A9: invoice number or date missing or illegible, so R4 / R5 cannot be evaluated.
+    # A fixed rule in both cases (DL-78): paying without those two checks would contradict
+    # the spec. Only the origin differs: an illegible field is the principle the client
+    # confirmed (DL-18); an absent one is an assumption (DL-35).
+    for value, illegible, message in (
+        (
+            invoice.invoice_number,
+            invoice.invoice_number_illegible,
+            "Invoice number is missing or unreadable; duplicate check cannot be performed",
+        ),
+        (
+            invoice.invoice_date,
+            invoice.invoice_date_illegible,
+            "Invoice date is missing or unreadable; date check cannot be performed",
+        ),
+    ):
+        if not value:
+            reasons.append(
+                _reason(
+                    "A9",
+                    message,
+                    Outcome.HELD_FOR_REVIEW,
+                    source=RuleSource.CONFIRMED if illegible else RuleSource.ASSUMPTION,
+                    decision_log_ref="DL-18" if illegible else "DL-35",
                 )
+            )
 
     # A1: inactive supplier (DL-01). A hold, not a rejection: the status can be stale or
     # reversed, so a human confirms. Rejected only when an R rule also fires.
@@ -298,15 +309,16 @@ def evaluate(
             )
         )
 
-    # A7: PO number printed but partially illegible (DL-19).
-    if "A7" in enabled and invoice.po_number_illegible:
+    # A7: PO number printed but partially illegible. Nothing is guessed. A fixed rule
+    # (DL-18, DL-19, DL-31): it cannot be switched off.
+    if invoice.po_number_illegible:
         reasons.append(
             _reason(
                 "A7",
                 "Purchase order number is partially illegible; the system does not guess it",
                 Outcome.HELD_FOR_REVIEW,
-                source=RuleSource.ASSUMPTION,
-                decision_log_ref="DL-19",
+                source=RuleSource.CONFIRMED,
+                decision_log_ref="DL-18",
             )
         )
 
@@ -348,19 +360,20 @@ def evaluate(
         received = context.received_by_po_line.get(key, Decimal("0"))
         already = context.already_invoiced_by_po_line.get(key, Decimal("0"))
 
-        # A6: quantity or price illegible. Nothing is inferred (DL-18).
+        # A6: quantity or price illegible. Nothing is inferred (DL-18, confirmed by the
+        # client). A fixed rule: it cannot be switched off.
         illegible = [
             label
             for label, value in (("quantity", line.quantity), ("unit price", line.unit_price))
             if value is None
         ]
-        if illegible and "A6" in enabled:
+        if illegible:
             reasons.append(
                 _reason(
                     "A6",
                     f"Line {n}: {' and '.join(illegible)} is illegible; the system does not infer it",
                     Outcome.HELD_FOR_REVIEW,
-                    source=RuleSource.ASSUMPTION,
+                    source=RuleSource.CONFIRMED,
                     decision_log_ref="DL-18",
                     line_number=n,
                 )
