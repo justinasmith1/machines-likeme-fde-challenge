@@ -6,7 +6,7 @@ Contoso receives supplier invoices. Each invoice is matched against its purchase
 
 Only invoice data extraction uses an LLM (Azure OpenAI). The rules engine is pure, deterministic Python with unit tests.
 
-Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), and the matching layer, persistence, audit trail and business services (phase 4A) are implemented. The HTTP API and the frontend are not implemented yet.
+Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), matching, persistence, audit trail and business services (phase 4A) and the HTTP API (phase 4B) are implemented. The frontend, real authentication and deployment are not implemented yet.
 
 ## Architecture
 
@@ -19,6 +19,7 @@ backend/app/
   extraction/  document rendering, Azure OpenAI client, cache, mapping to engine input
   matching/    supplier resolution, purchase orders, line mapping, duplicates, approved quantities
   services/    business operations with permissions and audit (no HTTP)
+  api/         HTTP endpoints: authenticate, validate, call a service, translate errors
   storage/     uploaded files behind a FileStore interface
   rules/       deterministic rules engine and its parameters
   db/          SQLAlchemy tables and session (SQLite now; portable to PostgreSQL / Azure SQL)
@@ -64,7 +65,7 @@ file -> render to PNG -> model (classify + transcribe) -> validation -> mapping 
 2. **Model call** (`extraction/client.py`). One request to the Azure OpenAI Responses API with the prompt and the page images, asking for JSON that follows a strict schema.
 3. **Validation** (`extraction/schema.py`). The answer is validated with Pydantic. Amounts are decimal strings and dates are ISO; anything else is rejected.
 4. **Mapping** (`extraction/mapper.py`). The validated answer becomes the engine input.
-5. **Decision** (`extraction/pipeline.py`). Only a document classified as an invoice reaches the rules engine.
+5. **Decision** (`services/invoices.py`). Only a document classified as an invoice reaches the rules engine; anything else is recorded as `NOT_AN_INVOICE`.
 
 ### What the model decides and what the code decides
 
@@ -97,6 +98,7 @@ The deployment allows about 10,000 tokens per minute, roughly three to four extr
 | Answer cut off by the output token limit | `TRUNCATED_MODEL_OUTPUT`, no retry. |
 | Empty, corrupt, oversized, too many pages, unsupported type | `UNREADABLE_DOCUMENT` or `UNSUPPORTED_DOCUMENT_TYPE`; the model is not called. |
 | Endpoint or key not configured | `MISSING_CREDENTIALS`; no request is made. |
+| Unexpected error while extracting or evaluating | `PROCESSING_ERROR`; the detail goes to the server log only, and the user sees a fixed plain message. |
 
 Any of these leaves the invoice as `EXTRACTION_FAILED` with the error code and a plain-language message, and it can be retried. Failures are not cached.
 
@@ -215,12 +217,100 @@ The price tolerance, the analyst approval limit, the rounding tolerance and the 
 
 A change affects only evaluations made after it. Each evaluation keeps a snapshot of the parameters it used, so an earlier decision can always be explained with the values that applied then (DL-11). Spec rules cannot be switched off; only assumption rules can (DL-27).
 
+## API
+
+The API is a thin layer over the services: it authenticates the caller, validates the request, calls a service and translates errors. Business rules and permissions live in the services. No endpoint changes reference data.
+
+| Method and path | Roles | What it does |
+|---|---|---|
+| `GET /api/me` | All | Current user and role. |
+| `POST /api/invoices` | All | Upload a document (multipart field `file`). Answers `202` with the id and status `PENDING_EXTRACTION`; extraction and evaluation run in the background. |
+| `GET /api/invoices` | All | List, newest first. Optional `?status=`. |
+| `GET /api/invoices/{id}` | All | Detail. The content depends on the role (see below). |
+| `GET /api/invoices/{id}/document` | All | The original file. |
+| `GET /api/invoices/{id}/audit` | AP Manager | Audit trail of the invoice (DL-56). |
+| `POST /api/invoices/{id}/retry` | AP Analyst, AP Manager | Retry a failed extraction, in the background. |
+| `POST /api/invoices/{id}/corrections` | AP Analyst, AP Manager | Correct extracted data: `{"corrections": {...}, "comment": "..."}`. |
+| `POST /api/invoices/{id}/decisions` | AP Analyst, AP Manager | Decide: `{"decision": "APPROVE" \| "REJECT" \| "REQUEST_CREDIT_NOTE" \| "OVERRIDE", "comment": "..."}`. |
+| `GET /api/review-queue` | AP Analyst, AP Manager | Invoices held for review with no decision in force, oldest first. |
+| `GET /api/parameters` | AP Analyst, AP Manager | Parameters in force (DL-57). |
+| `PUT /api/parameters` | AP Manager | New parameter version: `{"values": {...}, "comment": "..."}`. |
+| `GET /api/parameters/history` | AP Manager | Every parameter version. |
+| `GET /health` | Open | Liveness check. |
+
+**What each role sees of an invoice.** Reviewers get the extracted data with the reading status of each field, suggestions labelled as suggestions, the PO line each invoice line was mapped to and the method used, the evaluation in force with every reason (code, message, SPEC or ASSUMPTION, decision log reference), the parameter snapshot, every human decision including superseded ones, and the list of extraction versions. Intake users get only the file name, the upload time, the status and the reasons in plain language: no rule codes, no parameters, no reviewer names or comments, no audit trail (DL-60).
+
+**Errors** are JSON with a stable code and a readable message: `{"error": {"code": "PERMISSION_DENIED", "message": "..."}}`.
+
+| Situation | HTTP | Code |
+|---|---|---|
+| Not authenticated | 401 | `UNAUTHENTICATED` |
+| Role not allowed, or analyst above the approval limit | 403 | `PERMISSION_DENIED` |
+| Invoice does not exist | 404 | `NOT_FOUND` |
+| Action does not apply to the invoice in its status | 409 | `INVALID_STATE` |
+| File larger than `MAX_UPLOAD_MB` | 413 | `FILE_TOO_LARGE` |
+| Missing comment, invalid correction, unknown decision or status | 422 | `VALIDATION_ERROR` |
+| File type other than PDF, PNG or JPG | 422 | `UNSUPPORTED_DOCUMENT_TYPE` |
+
+CORS allows only the origin in `FRONTEND_ORIGIN` (DL-58).
+
+**Background processing.** The upload answers at once. Extraction and evaluation run afterwards in a FastAPI background task that opens its own database session, because the request's session is closed by then (DL-59). The client polls `GET /api/invoices/{id}` to see the status change.
+
+## Authentication
+
+Authentication sits behind a single dependency, `current_user`, which returns a user name and a role. Endpoints depend only on it.
+
+- **Now (development).** When `APP_ENV=development` is set explicitly, the user and role come from two request headers: `X-Dev-User` and `X-Dev-Role` (`INTAKE`, `AP_ANALYST` or `AP_MANAGER`). This is a development convenience, not security: anyone who can reach the API can claim any role.
+- **Any other environment, including when `APP_ENV` is not set.** The headers are ignored and every request is answered with `401`. `APP_ENV` defaults to `production`, so a system with missing configuration is closed, not open.
+- **Phase 6.** The dependency is replaced by Microsoft Entra ID (token validation, roles from app roles or groups). Endpoints and services do not change.
+
+## Running the API locally
+
+From `backend/`, with the virtual environment active and a `.env` that contains `APP_ENV=development` (see `.env.example`):
+
+```bash
+pip install -e ".[dev]"                                    # after pulling: picks up new dependencies
+python -m app.cli load-reference --dir ../data/reference   # once, and after reference data changes
+uvicorn app.main:app --reload                              # http://localhost:8000, docs at /docs
+```
+
+Starting the app creates any missing tables and seeds the rule parameters. It does not load reference data: that is always the CLI step above.
+
+Try it with the development headers. They work only because `.env` sets `APP_ENV=development`; without that line every request below gets `401`:
+
+```bash
+# Upload as an intake user
+curl -H "X-Dev-User: ines" -H "X-Dev-Role: INTAKE" -F "file=@../data/test-invoices/INV-05.pdf" http://localhost:8000/api/invoices
+
+# What the intake user sees, and what an analyst sees
+curl -H "X-Dev-User: ines" -H "X-Dev-Role: INTAKE" http://localhost:8000/api/invoices/1
+curl -H "X-Dev-User: ana" -H "X-Dev-Role: AP_ANALYST" http://localhost:8000/api/invoices/1
+
+# Decide, with a mandatory comment
+curl -H "X-Dev-User: ana" -H "X-Dev-Role: AP_ANALYST" -H "Content-Type: application/json" \
+  -d '{"decision": "APPROVE", "comment": "Price agreed with purchasing."}' \
+  http://localhost:8000/api/invoices/1/decisions
+
+# Audit trail, AP Manager only
+curl -H "X-Dev-User: max" -H "X-Dev-Role: AP_MANAGER" http://localhost:8000/api/invoices/1/audit
+```
+
+An upload calls the model unless the same file was extracted before with the same prompt, schema and deployment, in which case the answer comes from `data/cache/`.
+
+### Known limitations
+
+- **No schema migrations.** Tables are created with `create_all`, which adds missing tables but never alters existing ones. After pulling a change to the tables, delete the local database file (`backend/contoso.db`) and load the reference data again. Production needs a migration tool such as Alembic.
+- **In-process background work.** Background tasks run inside the API process, with no queue. An unexpected error while processing marks the invoice `EXTRACTION_FAILED` (code `PROCESSING_ERROR`) so it can be retried. Only if the process itself stops mid-task does the invoice stay `PENDING_EXTRACTION`, and it is not resumed automatically (DL-59).
+- **SQLite.** Fine for one process. Several API processes writing at once need PostgreSQL or Azure SQL.
+
 ## Configuration
 
 Read from environment variables / `.env` (see `.env.example`).
 
 | Variable | Default | Notes |
 |---|---|---|
+| `APP_ENV` | `production` | Set to `development` in a local `.env` to enable the development login headers. Any other value, or no value, disables them (DL-55) |
+| `FRONTEND_ORIGIN` | `http://localhost:3000` | The only browser origin allowed to call the API (DL-58) |
 | `AZURE_OPENAI_ENDPOINT` | – | Base URL of the v1 API; requests go to `{endpoint}/responses`. Needed only for extraction |
 | `AZURE_OPENAI_API_KEY` | – | Secret. Needed only for extraction |
 | `AZURE_OPENAI_DEPLOYMENT` | `JustinaSmith-RCS2` | |
@@ -245,6 +335,8 @@ Read from environment variables / `.env` (see `.env.example`).
 - Model responses are cached under `data/cache/`, which is git-ignored because it contains real invoice data.
 - Uploaded documents are stored under `data/uploads/`, which is git-ignored.
 - Tests never reach the network: a test guard fails on any real connection.
+- The development login headers work only when `APP_ENV=development` is set explicitly. The default is `production`: with no configuration the API answers 401 to everything, until real authentication is configured (DL-55).
+- Intake users never receive rule codes, parameters, reviewer names or comments, or the audit trail (DL-60).
 
 ## Deployment
 
@@ -314,3 +406,10 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-52 | Enforcement of the append-only audit trail. | Assumed: enforced by the application, which refuses any update or delete of an audit event. | Database-level protection (INSERT and SELECT only for the application user) is a deployment task. | open |
 | DL-53 | Invoice history and reference reloads. | Assumed: invoices and evaluations keep supplier and purchase order identifiers as values, not foreign keys, together with the reference file hashes in force. | Reloading reference data (DL-23) cannot break or rewrite history. Past evaluations are not recomputed when reference data changes. | open |
 | DL-54 | Ambiguous matches. | Assumed: a supplier or a PO line is matched only when exactly one candidate fits. Two candidates resolve to none. | An ambiguous supplier leads to R3 and an ambiguous line to H3, so a person decides instead of the system guessing. | open |
+| DL-55 | Development authentication. | Assumed: `APP_ENV` defaults to `production`, where the development headers are always ignored and every request gets 401. Only when `APP_ENV=development` is set explicitly, in a local `.env`, do the user and role come from the `X-Dev-User` and `X-Dev-Role` headers. Reason: if the configuration is missing, the system is closed, not open. Microsoft Entra ID replaces the headers in phase 6 behind the same dependency. | A developer must add `APP_ENV=development` to `.env`; `.env.example` has it. The headers are a convenience, not security: in development anyone can claim any role. | open |
+| DL-56 | Who sees the audit trail. | Assumed: the AP Manager only, as the brief gives the manager the full audit trail. | AP Analysts see, in the invoice detail, what they need to decide: extraction versions, the evaluation and every human decision. Intake users see neither. | open |
+| DL-57 | Who reads the rule parameters. | Assumed: AP Analysts and the AP Manager can read the parameters in force; only the AP Manager changes them and sees the version history. Intake users cannot read them. | Analysts can see the tolerance and the approval limit that explain an outcome. | open |
+| DL-58 | CORS. | Assumed: only the origin in `FRONTEND_ORIGIN` may call the API from a browser. | One frontend origin per environment. | open |
+| DL-59 | Background processing. | Assumed: extraction and evaluation run in an in-process background task after the upload answers, with a database session of their own. An unexpected error while processing marks the invoice EXTRACTION_FAILED with code PROCESSING_ERROR and a plain message, writes an audit event, and the invoice can be retried like any other failure. | The error detail goes to the server log only; nothing internal is stored or shown. Whatever the failed attempt had written is rolled back. No queue: if the process itself stops mid-task the invoice stays PENDING_EXTRACTION and is not resumed. A durable queue is a deployment decision. | open |
+| DL-60 | What intake users see. | Assumed: every invoice, not only their own uploads, limited to file name, upload time, status and plain-language reasons. Reviewer names and comments are not shown. Reason: the brief says the intake user can view the status of each submitted invoice, without restricting it to their own; intake is treated as a shared team inbox. | Rule reasons are shown as written by the engine, which includes PO prices and quantities. Restricting intake users to their own uploads would need a filter by uploader. | open |
+| DL-61 | Upload checks at the API. | Assumed: an unsupported file type or an empty file is refused at upload (422), and a file over the limit with 413, instead of being registered and failing extraction. | Only readable documents become invoices. A corrupt PDF or image is still detected at extraction and can be retried. | open |
