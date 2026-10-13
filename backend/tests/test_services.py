@@ -136,6 +136,14 @@ def test_quotation_ends_as_not_an_invoice_without_an_evaluation(harness):
     assert harness.events(invoice.id)[-1] == "CLASSIFIED_NOT_AN_INVOICE"
 
 
+@pytest.mark.parametrize("document_type", ["quotation", "credit_note", "other"])
+def test_no_non_invoice_document_reaches_the_engine(harness, document_type):
+    invoice = harness.submit({"document_type": document_type})
+    assert invoice.status == InvoiceStatus.NOT_AN_INVOICE.value
+    assert harness.service.latest_evaluation(invoice.id) is None
+    assert "INVOICE_EVALUATED" not in harness.events(invoice.id)
+
+
 def test_only_a_pending_invoice_can_be_processed(harness):
     invoice = harness.submit()
     with pytest.raises(InvalidState):
@@ -171,6 +179,57 @@ def test_failed_extraction_can_be_retried(harness):
         "EXTRACTION_SUCCEEDED",
         "INVOICE_EVALUATED",
     ]
+
+
+def test_unexpected_error_while_processing_becomes_a_retryable_failure(harness, caplog):
+    secret = "stack detail with internals"
+
+    def broken(file_bytes, filename):
+        raise RuntimeError(secret)
+
+    working = harness.service._extract
+    harness.service._extract = broken
+    invoice = harness.service.submit_invoice(b"content", "invoice.pdf", INTAKE)
+    harness.service.process_invoice(invoice.id)  # does not raise
+
+    assert invoice.status == InvoiceStatus.EXTRACTION_FAILED.value
+    assert invoice.status_reason == (
+        "The document could not be processed because of an unexpected error. It can be retried."
+    )
+    failure = harness.service.audit_trail(invoice.id)[-1]
+    assert failure.event_type == "EXTRACTION_FAILED"
+    assert failure.details["error_code"] == "PROCESSING_ERROR"
+    assert secret not in str(failure.details) and secret not in invoice.status_reason
+    assert secret in caplog.text  # only the server log has the detail
+
+    harness.service._extract = working
+    harness.service.retry_extraction(invoice.id, ANALYST)
+    harness.extractor.queue.append(extraction_result())
+    harness.service.process_invoice(invoice.id)
+    assert invoice.status == InvoiceStatus.AUTO_PAY.value
+    assert harness.events(invoice.id) == [
+        "INVOICE_SUBMITTED",
+        "EXTRACTION_FAILED",
+        "EXTRACTION_RETRY_REQUESTED",
+        "EXTRACTION_SUCCEEDED",
+        "INVOICE_EVALUATED",
+    ]
+
+
+def test_error_after_a_successful_extraction_leaves_nothing_half_written(harness, monkeypatch):
+    from app.services import invoices as invoices_module
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("engine exploded")
+
+    monkeypatch.setattr(invoices_module, "evaluate_and_store", broken)
+    invoice = harness.submit()
+
+    assert invoice.status == InvoiceStatus.EXTRACTION_FAILED.value
+    # The extraction version written before the error was rolled back with it.
+    assert harness.service.latest_extraction(invoice.id) is None
+    assert harness.service.latest_evaluation(invoice.id) is None
+    assert harness.events(invoice.id) == ["INVOICE_SUBMITTED", "EXTRACTION_FAILED"]
 
 
 def test_retry_only_applies_to_a_failed_extraction(harness):

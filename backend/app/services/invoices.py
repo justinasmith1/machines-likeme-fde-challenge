@@ -17,6 +17,7 @@ Example: PENDING_EXTRACTION -> HELD_FOR_REVIEW -> (correction) HELD_FOR_REVIEW -
 """
 
 import hashlib
+import logging
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,13 @@ from app.services.evaluation import evaluate_and_store
 from app.storage.files import FileStore
 
 Extractor = Callable[[bytes, str], ExtractionResult]
+
+logger = logging.getLogger(__name__)
+
+PROCESSING_ERROR = "PROCESSING_ERROR"
+_PROCESSING_ERROR_MESSAGE = (
+    "The document could not be processed because of an unexpected error. It can be retried."
+)
 
 # Statuses a person can decide on: every final status of an invoice (DL-48).
 # Not decidable: PENDING_EXTRACTION, EXTRACTION_FAILED and NOT_AN_INVOICE.
@@ -165,12 +173,41 @@ class InvoiceService:
         return invoice
 
     def process_invoice(self, invoice_id: int) -> InvoiceRow:
-        """Extract and evaluate a pending invoice. Safe to run in a background task."""
+        """Extract and evaluate a pending invoice. Safe to run in a background task.
+
+        An unexpected error never leaves the invoice pending: it becomes EXTRACTION_FAILED
+        with code PROCESSING_ERROR, an audit event is written, and it can be retried (DL-59).
+        """
         invoice = self.get_invoice(invoice_id)
         if invoice.status != InvoiceStatus.PENDING_EXTRACTION.value:
             raise InvalidState(
                 f"Invoice {invoice_id} is {invoice.status}; only a pending invoice can be processed."
             )
+        try:
+            return self._extract_and_evaluate(invoice)
+        except Exception as exc:
+            # The detail goes to the server log only. What is stored and shown is a fixed,
+            # plain message: no internals and nothing that came from the failing code.
+            logger.exception("Unexpected error while processing invoice %s", invoice_id)
+            self._session.rollback()
+            invoice = self.get_invoice(invoice_id)
+            invoice.status = InvoiceStatus.EXTRACTION_FAILED.value
+            invoice.status_reason = _PROCESSING_ERROR_MESSAGE
+            record_event(
+                self._session,
+                "EXTRACTION_FAILED",
+                timestamp=self._clock(),
+                invoice_id=invoice.id,
+                details={
+                    "error_code": PROCESSING_ERROR,
+                    "errors": [_PROCESSING_ERROR_MESSAGE],
+                    "error_type": type(exc).__name__,
+                },
+            )
+            self._session.commit()
+            return invoice
+
+    def _extract_and_evaluate(self, invoice: InvoiceRow) -> InvoiceRow:
         result = self._extract(self._files.load(invoice.stored_path), invoice.filename)
         now = self._clock()
 
