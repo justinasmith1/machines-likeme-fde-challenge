@@ -6,7 +6,7 @@ Contoso receives supplier invoices. Each invoice is matched against its purchase
 
 Only invoice data extraction uses an LLM (Azure OpenAI). The rules engine is pure, deterministic Python with unit tests.
 
-Status: reference data loader (phase 1), rules engine (phase 2) and invoice extraction (phase 3) are implemented. The matching layer, persistence of invoices, the API and the frontend are not implemented yet.
+Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), and the matching layer, persistence, audit trail and business services (phase 4A) are implemented. The HTTP API and the frontend are not implemented yet.
 
 ## Architecture
 
@@ -17,8 +17,11 @@ backend/app/
   domain/      enums and domain models
   reference/   JSON schemas + loader/validator for reference data
   extraction/  document rendering, Azure OpenAI client, cache, mapping to engine input
+  matching/    supplier resolution, purchase orders, line mapping, duplicates, approved quantities
+  services/    business operations with permissions and audit (no HTTP)
+  storage/     uploaded files behind a FileStore interface
   rules/       deterministic rules engine and its parameters
-  db/          SQLAlchemy tables and session (SQLite now, Azure SQL later)
+  db/          SQLAlchemy tables and session (SQLite now; portable to PostgreSQL / Azure SQL)
   cli.py       command line entry points
 backend/scripts/
   run_extraction_eval.py   manual evaluation against the real model (not part of pytest)
@@ -123,6 +126,95 @@ An earlier run with prompt version 1 also gave 12 of 12 outcomes, with one field
 
 It was corrected in two places. The code normalizes tax identifiers on both sides before comparing them (DL-43), which is the main defence because it does not depend on the model. The prompt (version 2) also asks for values without their labels, and the difference no longer appears.
 
+## Data model
+
+SQLAlchemy models, SQLite for now. Column types are chosen to port to PostgreSQL or Azure SQL. The schema is created with `create_all`, which creates missing tables but does not alter existing ones: during development, delete the local database file after a schema change. A migration tool (Alembic) is needed once there is data to keep.
+
+| Table | One row per | Notes |
+|---|---|---|
+| `ref_suppliers`, `ref_purchase_orders`, `ref_po_lines`, `ref_grns`, `ref_grn_lines` | Reference record | Replaced as a whole on each reference load (DL-23). |
+| `ref_sources` | Loaded version of a reference file | File name, SHA-256, load time. |
+| `invoices` | Uploaded document | File name, content hash, stored path, who uploaded it and when, current status, and the supplier, invoice number, total and currency from the latest evaluation. |
+| `extraction_versions` | Extraction of an invoice | Version 1 comes from the model; each human correction adds a version. Holds the validated data, the raw model response, prompt version and model. |
+| `evaluations` | Run of the rules engine | Outcome, every reason (code, message, source, decision log reference), the parameter snapshot, the reference data hashes, and how the invoice was matched. Never modified. |
+| `human_decisions` | Decision by a person | Decision, previous status, mandatory comment, who decided, their role and the role that was required. A decision replaced by a later one, or by a correction of the data, is marked as superseded and kept. |
+| `audit_events` | Thing that happened | Append-only. |
+| `rule_parameters` | Version of the parameters | The highest version is in force. |
+
+Invoices refer to suppliers and purchase orders by value, not by foreign key, so reloading reference data neither breaks nor rewrites invoice history. What was true at the time is kept in the evaluation: the reference file hashes and the matching result.
+
+Uploaded files are stored as `data/uploads/<sha256>.<ext>` (git-ignored) behind a `FileStore` interface, so the local folder can be replaced by Azure Blob Storage in deployment (DL-44).
+
+## Matching
+
+`matching/` builds everything the rules engine needs for one invoice, from the database. It is deterministic code; the model does not take part (DL-38).
+
+- **Supplier:** by normalized tax identifier (DL-43); if that finds nothing, by exact normalized legal name; otherwise unresolved, and the engine rejects under R3. A match must be unique.
+- **Purchase orders:** every PO number read from the document is looked up. The ones that do not exist are reported to the engine (R2). More than one PO on an invoice always holds it (A10, DL-37).
+- **Received quantity:** the sum of every goods received note for the PO line.
+- **Quantity already invoiced:** only invoices approved for payment count, that is Auto-Pay or approved by a person (DL-21, DL-36). Held, rejected and undecided invoices reserve nothing, and neither does an Auto-Pay invoice that a reviewer later rejected.
+- **Duplicates:** any invoice uploaded earlier with the same supplier and invoice number, whatever its status (DL-25).
+- **Line mapping** (DL-15), using the first method that finds exactly one PO line:
+
+| Order | Method | Rule |
+|---|---|---|
+| 1 | `PRINTED_PO_LINE` | The PO line number printed on the document, if that line exists. |
+| 2 | `DESCRIPTION` | Normalized description identical to a PO line description. |
+| 3 | `ITEM_CODE` | A PO line item code contained in the invoice line description. |
+| 4 | `UNMAPPED` | No single match. The engine holds the invoice (H3). |
+
+The method used for each line is stored with the evaluation and can be shown to the analyst.
+
+## Audit trail
+
+Every change of status writes a row in `audit_events`: who (or `system`), with which role, when, and the details. Examples: `INVOICE_SUBMITTED`, `EXTRACTION_SUCCEEDED`, `EXTRACTION_FAILED`, `CLASSIFIED_NOT_AN_INVOICE`, `INVOICE_EVALUATED`, `EXTRACTION_CORRECTED`, `HELD_AFTER_CORRECTION`, `HUMAN_DECISION_RECORDED`, `HUMAN_DECISION_SUPERSEDED`, `DECISION_DENIED`, `PARAMETERS_UPDATED`.
+
+The table is append-only. The application refuses any update or delete of an audit event, whether made through an object or through a bulk statement, and a test verifies it (DL-52). In deployment the database user should additionally be granted only INSERT and SELECT on this table.
+
+For any invoice, the trail together with `extraction_versions`, `evaluations` and `human_decisions` answers: what was read from the document and by whom, which rules fired, with which parameters and which reference data, who decided what and why.
+
+## Human decisions
+
+Permissions are enforced in the services, not only at the API, and failures raise typed errors (`PermissionDenied`, `NotFound`, `InvalidState`, `ValidationError`) (DL-47).
+
+An AP Analyst or the AP Manager can change the final status of any invoice (DL-48):
+
+| Decision | Applies when | Resulting status |
+|---|---|---|
+| Approve | The rules engine did not reject the invoice, and it is not already payable. | `APPROVED_FOR_PAYMENT` |
+| Override | The rules engine rejected the invoice (DL-13). | `OVERRIDDEN` |
+| Reject | Any final status, including Auto-Pay. | `REJECTED_BY_REVIEWER` |
+| Request credit note | Any final status, including Auto-Pay. | `CREDIT_NOTE_REQUESTED` |
+
+The status names do not say who decided, because the AP Manager uses them too. Who decided, with which role, and which role was required are kept in `human_decisions`.
+
+- **A comment is mandatory** for every decision, including a second one.
+- **Intake users cannot decide.**
+- **Not decidable:** an invoice that is still `PENDING_EXTRACTION` or `EXTRACTION_FAILED`, and a document that is not an invoice, which can never be approved for payment (DL-16).
+- **A new decision replaces the previous one.** The previous decision stays in `human_decisions`, marked as superseded; nothing is deleted.
+- **Approval limit:** approving or overriding an invoice whose total is above the analyst approval limit in force requires the AP Manager, also when there was an earlier decision. An analyst who tries gets a clear permission error, and the attempt is written to the audit trail. Rejecting or requesting a credit note does not release payment and is not limited (DL-49).
+- **The engine's evaluation is never modified.** The decision records the previous status next to it.
+
+### Corrections never approve payment
+
+An analyst or the manager can correct the extracted data. That adds an extraction version and evaluates the invoice again with the parameters in force; earlier versions and evaluations stay in the history (DL-12).
+
+Correcting data is not approving payment (DL-46). The new evaluation is stored with the engine's outcome, which may be Auto-Pay, but the invoice stays `HELD_FOR_REVIEW` until a person decides, whether or not anyone had decided before. Its detail shows the reason: "Extracted data was corrected by <user>; a human decision is required before payment." A decision taken on the earlier data is marked as superseded.
+
+The same person may correct and then approve. They are two separate actions, each with its own comment and audit event; a second person is not required.
+
+Status path of a held invoice that is corrected and approved:
+
+```
+PENDING_EXTRACTION -> HELD_FOR_REVIEW -> (correction) HELD_FOR_REVIEW -> (approval) APPROVED_FOR_PAYMENT
+```
+
+## Parameters
+
+The price tolerance, the analyst approval limit, the rounding tolerance and the list of enabled assumption rules are stored in `rule_parameters`, as versions. Only the AP Manager can change them, with a mandatory comment; a change adds a version and writes an audit event. The first version is seeded from configuration.
+
+A change affects only evaluations made after it. Each evaluation keeps a snapshot of the parameters it used, so an earlier decision can always be explained with the values that applied then (DL-11). Spec rules cannot be switched off; only assumption rules can (DL-27).
+
 ## Configuration
 
 Read from environment variables / `.env` (see `.env.example`).
@@ -142,6 +234,7 @@ Read from environment variables / `.env` (see `.env.example`).
 | `PDF_RENDER_DPI` | `170` | DL-42 |
 | `PDF_MAX_PAGES` | `5` | Longer PDFs are rejected (DL-42) |
 | `MAX_UPLOAD_MB` | `10` | Larger files are rejected (DL-42) |
+| `UPLOADS_DIR` | `data/uploads` | Uploaded documents; relative paths resolve against the repo root (DL-44) |
 
 ## Security notes
 
@@ -150,6 +243,7 @@ Read from environment variables / `.env` (see `.env.example`).
 - The model is called only from the server. The browser never receives keys or calls Azure OpenAI directly.
 - Real reference data and test invoices are not committed (DL-22).
 - Model responses are cached under `data/cache/`, which is git-ignored because it contains real invoice data.
+- Uploaded documents are stored under `data/uploads/`, which is git-ignored.
 - Tests never reach the network: a test guard fails on any real connection.
 
 ## Deployment
@@ -180,7 +274,7 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-12 | Data correction after a decision. | Assumption: new extraction version, re-evaluation, full history kept. | Versioned extractions and evaluations; append-only history. | open |
 | DL-13 | Override of a Rejected. | Adopted: a Rejected outcome is not final. An AP Analyst may override it with a mandatory comment; overriding an automatic outcome whose total exceeds the analyst limit requires the AP Manager. The audit trail keeps the original outcome and the human decision. Source: Recruitment reply, 12 Oct 2026. | Override is outside the engine (phase 4). | closed |
 | DL-14 | Meaning of Auto-Pay. | Assumption: only records the decision, no payment integration. | No payment code. | open |
-| DL-15 | Mapping invoice line to PO line. | Assumption: first by item code, then by description; mapping is stored; no mapping means hold. | Store the mapping per line. | open |
+| DL-15 | Mapping invoice line to PO line. | Assumption: first by item code, then by description; mapping is stored; no mapping means hold. | Store the mapping per line. Implemented in the matching layer (phase 4) in this order: PO line printed on the document, identical normalized description, item code contained in the description. A method counts only if it finds exactly one PO line. | open |
 | DL-16 | Documents that are not invoices (e.g. quotations). | Adopted: non-invoice documents are recorded with status NOT_AN_INVOICE before the engine runs, are never payable, and the intake user sees "received, not an invoice". Source: Recruitment reply, 12 Oct 2026. | Classifier before the engine (phase 3). | closed |
 | DL-17 | Rounding in totals. | Adopted: 0.01 tolerance on totals and lines. Larger mismatches hold under A5. Source: Recruitment reply, 12 Oct 2026. | Rule A5 in the engine, using `rounding_tolerance`. | closed |
 | DL-18 | Illegible field (quantity, price). | Adopted: illegible fields hold; the system never infers a value. Any suggested value must be labelled as a suggestion in the UI. Source: Recruitment reply, 12 Oct 2026. | Rule A6 in the engine, and a UI requirement for phase 5. | closed |
@@ -202,10 +296,21 @@ Entries marked closed with source 'Recruitment reply' were confirmed by the clie
 | DL-34 | Invoice supplier not resolved to the supplier master. | Assumed: when the invoice supplier cannot be matched to the master and a PO is referenced, R3 applies (reject). | The matching layer (phase 4) must report an unresolved supplier as None, not guess. | open |
 | DL-35 | Missing or unreadable invoice number or invoice date. | Assumed: hold. The duplicate check (R4) and the date check (R5) cannot be evaluated, and the system does not infer the value. | Rule A9 (ASSUMPTION, holds), one reason per missing field. Disableable through `enabled_assumption_rules` without a code change. | open |
 | DL-36 | Held invoices approved later by a human. | Adopted: an invoice that was held and is later approved for payment by an AP Analyst or AP Manager reserves its quantities from that moment, exactly like an AUTO_PAY invoice. Rejected invoices and invoices still held reserve nothing. | The matching layer (phase 4) must count AUTO_PAY plus human-approved invoices; the engine is unchanged; current tests only count AUTO_PAY because human approval does not exist yet. | open |
-| DL-37 | Multiple PO references on one invoice. | Assumed: the rules engine evaluates one purchase order per invoice. The first reference read from the document is matched, the full list is kept with the extraction, and the invoice carries a visible `MULTIPLE_PO_REFERENCES` flag with a plain-language note. | The engine is unchanged. The flag does not by itself hold the invoice: whether a flagged invoice must always be held, and how lines on the other purchase orders are checked (DL-09), is decided in the matching layer (phase 4). | open |
+| DL-37 | Multiple PO references on one invoice. | Adopted (candidate decision): an invoice that references more than one purchase order is always held, so that an analyst confirms how it splits across the orders. | Rule A10 (ASSUMPTION, holds), switchable through `enabled_assumption_rules`. The mapper keeps the full list of PO references and a `MULTIPLE_PO_REFERENCES` flag; the matching layer looks up every referenced order. | closed |
 | DL-38 | Division of work between the model and the code. | Assumed: the model classifies and transcribes; it never computes, corrects or maps lines to the purchase order. | Line-to-PO mapping is deterministic code (phase 4). The model reports a PO line number only when the document prints one. | open |
 | DL-39 | Illegible versus absent fields, and suggested values. | Assumed: the model decides per field whether it was read, is illegible or is absent, and that status is shown to the analyst. Suggested values are displayed as suggestions and never used by the engine. | Status fields in the extraction schema; the mapper passes no suggestion on; a guess placed in the value of an unread field is demoted to a suggestion. | open |
 | DL-40 | Extraction cache. | Assumed: keyed by file hash, prompt version, schema version and deployment. | Changing the file, the prompt, the schema or the deployment causes a new model call. Failed extractions are not cached. | open |
 | DL-41 | Rate limit handling. | Assumed: `Retry-After` first, then exponential backoff with jitter; after 3 retries (configurable) the invoice is marked EXTRACTION_FAILED and can be retried. | Typed errors with a stable code are stored with the invoice. | open |
 | DL-42 | PDF and upload handling. | Assumed: PDFs are rasterized at 170 DPI, up to 5 pages, and uploads are limited to 10 MB (all configurable). Larger documents are rejected with a clear message, not truncated. | No page is silently ignored. Supported types: PDF, PNG, JPG. | open |
 | DL-43 | Supplier tax identifier format. | Assumed: supplier tax identifiers are normalized before matching (labels, spaces, dots and hyphens removed, upper case). The raw extracted value is kept for audit. Reason: in evaluation the model once returned the printed label with the value. | `normalize_tax_id` is applied to both the extracted value and the master value when they are compared; stored data is not changed. The prompt also asks for values without labels. | open |
+| DL-44 | Storage of uploaded files. | Assumed: files are stored in a local folder as `data/uploads/<sha256>.<ext>`, behind a `FileStore` interface. The same file uploaded twice is stored once. | The folder is git-ignored. Deployment replaces the implementation with Azure Blob Storage without changing the services. | open |
+| DL-45 | Submission and processing are separate steps. | Assumed: submitting an invoice stores the file and registers it as PENDING_EXTRACTION; extraction and evaluation run afterwards and can run in the background. | The upload answers at once and the intake user sees the status change. A failed extraction can be retried without uploading again. | open |
+| DL-46 | Correction after a human decision. | Assumed: correcting data is not approving payment. An invoice whose data a person corrected never moves to Auto-Pay by itself: it is evaluated again, the evaluation keeps the engine outcome, and the invoice stays HELD_FOR_REVIEW until a person decides, whether or not there was a decision before. An earlier decision is marked as superseded. Reason: the recruitment reply asks to hold such cases for human confirmation, and a payment must not be a side effect of a data correction. | The invoice detail shows "Extracted data was corrected by <user>; a human decision is required before payment." The same person may correct and then approve, as two separate actions with their own comment and audit event; a second person is not required. If the engine rejects the corrected data, releasing payment needs an override. | open |
+| DL-47 | Where permissions are enforced. | Assumed: in the services, not only in the API, with typed errors. | Any future entry point (API, script, background job) gets the same rules. Refused decision attempts are written to the audit trail. | open |
+| DL-48 | Which human decisions apply to which status. | Assumed: a reviewer can decide on an invoice in any final status, including Auto-Pay, because the brief says an AP analyst may change the final status of any invoice. A new decision replaces the previous one, which stays in the history marked as superseded. A comment is always mandatory. | Still in force: the approval limit for approve and override (DL-49); a document that is not an invoice can never be approved for payment; intake users cannot decide; invoices pending or failed extraction cannot be decided. Approve applies when the engine did not reject the invoice and override when it did. Invoices evaluated earlier are not recomputed when a decision changes what counts as approved for payment. | open |
+| DL-49 | Scope of the analyst approval limit. | Assumed: the limit applies to decisions that release payment (approve, override). The total must be strictly above the limit for the AP Manager to be required. An invoice with no readable total requires the AP Manager. Totals are compared with the limit as numbers, without currency conversion. | Rejecting or requesting a credit note is open to analysts at any amount. A multi-currency limit would need exchange rates. Limitation: totals are compared without currency conversion; all reference data is in USD. | open |
+| DL-50 | Human corrections of extracted data. | Assumed: only an AP Analyst or the AP Manager can correct, with a mandatory comment. A value entered by a person counts as read, not as a suggestion. A correction can also reclassify the document. | A failed extraction has no data to correct: it is retried, not keyed in by hand. | open |
+| DL-51 | What 'earlier invoice' means for duplicates. | Assumed: earlier by upload order, not by processing order. | The result does not depend on which of two copies finishes extraction first. An earlier upload that has not been extracted yet is not seen as a duplicate source. | open |
+| DL-52 | Enforcement of the append-only audit trail. | Assumed: enforced by the application, which refuses any update or delete of an audit event. | Database-level protection (INSERT and SELECT only for the application user) is a deployment task. | open |
+| DL-53 | Invoice history and reference reloads. | Assumed: invoices and evaluations keep supplier and purchase order identifiers as values, not foreign keys, together with the reference file hashes in force. | Reloading reference data (DL-23) cannot break or rewrite history. Past evaluations are not recomputed when reference data changes. | open |
+| DL-54 | Ambiguous matches. | Assumed: a supplier or a PO line is matched only when exactly one candidate fits. Two candidates resolve to none. | An ambiguous supplier leads to R3 and an ambiguous line to H3, so a person decides instead of the system guessing. | open |
