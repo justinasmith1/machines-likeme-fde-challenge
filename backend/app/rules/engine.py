@@ -4,7 +4,7 @@ Pure: no database, no network, no global clock, no LLM. Same input, same Decisio
 
 Precedence (spec section 7, DL-28):
   1. REJECTED: any rejection rule (R1-R5 from the spec, A2 assumption) rejects.
-  2. HELD_FOR_REVIEW: otherwise, any hold rule (H1-H3 from the spec, A1 and A3-A9 assumptions).
+  2. HELD_FOR_REVIEW: otherwise, any hold rule (H1-H3 from the spec, A1 and A3-A10 assumptions).
   3. AUTO_PAY: the default when no rule fires.
 
 Every rule is evaluated and every triggered rule is reported. Precedence only decides
@@ -283,6 +283,20 @@ def evaluate(
                     decision_log_ref="DL-08",
                 )
             )
+
+    # A10: more than one purchase order on the invoice (DL-37). Always a hold: an analyst
+    # confirms how the invoice splits across the orders.
+    all_po_numbers = set(referenced) | set(context.purchase_orders) | set(context.missing_po_numbers)
+    if "A10" in enabled and len(all_po_numbers) > 1:
+        reasons.append(
+            _reason(
+                "A10",
+                "Invoice references more than one purchase order; an analyst must confirm the split.",
+                Outcome.HELD_FOR_REVIEW,
+                source=RuleSource.ASSUMPTION,
+                decision_log_ref="DL-37",
+            )
+        )
 
     # A7: PO number printed but partially illegible (DL-19).
     if "A7" in enabled and invoice.po_number_illegible:

@@ -180,3 +180,36 @@ def test_a9_disabled_without_other_reasons_is_auto_pay():
     decision = evaluate(make_invoice(invoice_number=None, invoice_date=None), make_context(), params)
     assert decision.reasons == []
     assert decision.outcome is Outcome.AUTO_PAY
+
+
+def _two_po_context():
+    other = make_po(po_number="PO-2026-0009")
+    return make_context(purchase_orders={PO: make_po(), "PO-2026-0009": other})
+
+
+def test_a10_more_than_one_purchase_order_always_holds():
+    decision = evaluate(make_invoice(), _two_po_context(), P)
+    assert codes(decision) == ["A10"]
+    r = _reason(decision, "A10")
+    assert r.source is RuleSource.ASSUMPTION and r.decision_log_ref == "DL-37"
+    assert r.message == (
+        "Invoice references more than one purchase order; an analyst must confirm the split."
+    )
+    assert decision.outcome is Outcome.HELD_FOR_REVIEW
+
+
+def test_a10_counts_a_missing_purchase_order_as_a_reference():
+    context = make_context(missing_po_numbers=["PO-2026-0199"])
+    decision = evaluate(make_invoice(), context, P)
+    assert {"A10", "R2"} <= set(codes(decision))
+    assert decision.outcome is Outcome.REJECTED  # a rejection still wins
+
+
+def test_a10_neighbour_single_purchase_order():
+    assert "A10" not in codes(evaluate(make_invoice(), make_context(), P))
+
+
+def test_a10_can_be_switched_off():
+    params = RuleParameters(enabled_assumption_rules=frozenset())
+    decision = evaluate(make_invoice(), _two_po_context(), params)
+    assert decision.reasons == [] and decision.outcome is Outcome.AUTO_PAY
