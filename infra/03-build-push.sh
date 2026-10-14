@@ -37,11 +37,10 @@ command -v docker > /dev/null 2>&1 || die "Docker is not installed."
 succeeds docker info || die "Docker is not running. Start Docker Desktop and run this again."
 command -v git > /dev/null 2>&1 || die "git is not on the PATH."
 load_subscription
-REPO_ROOT="$(cd "$INFRA_DIR/.." && pwd)"
 
 step "Version"
-TAG="$(git -C "$REPO_ROOT" rev-parse --short HEAD | tr -d '\r')"
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- backend frontend)" ]; then
+TAG="$(git -C "$INFRA_DIR/.." rev-parse --short HEAD | tr -d '\r')"
+if [ -n "$(git -C "$INFRA_DIR/.." status --porcelain -- backend frontend)" ]; then
   if [ "$ALLOW_DIRTY" = "1" ]; then
     TAG="$TAG-dirty"
     warn "backend/ or frontend/ has uncommitted changes. The images get the tag $TAG."
@@ -60,8 +59,8 @@ info "Backend:  $API_REF"
 info "Frontend: $WEB_REF"
 
 step "Build (on this machine)"
-docker build --platform linux/amd64 --tag "$API_REF" "$REPO_ROOT/backend"
-docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_AUTH_MODE=entra --tag "$WEB_REF" "$REPO_ROOT/frontend"
+docker build --platform linux/amd64 --tag "$API_REF" "$INFRA_DIR/../backend"
+docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_AUTH_MODE=entra --tag "$WEB_REF" "$INFRA_DIR/../frontend"
 
 # ---------------------------------------------------------------- what must not be inside
 
