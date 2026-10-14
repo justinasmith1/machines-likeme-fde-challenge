@@ -61,7 +61,7 @@ for path in "/" "/invoices" "/review" "/parameters" "/api/me" "/api/invoices"; d
   answer="$(request "$WEB$path")"
   if refused "$answer"; then pass "GET $path -> ${answer%% *} (sign-in required)"; else fail "GET $path -> $answer   (expected 401 or a redirect to the sign-in page)"; fi
 done
-answer="$(request "$WEB/api/invoices" --request POST --form "file=@$INFRA_DIR/lib.sh")"
+answer="$(request "$WEB/api/invoices" --request POST --form "file=@$(native_path "$INFRA_DIR/lib.sh")")"
 if refused "$answer"; then pass "POST /api/invoices -> ${answer%% *} (an upload without a sign-in is refused)"; else fail "POST /api/invoices -> $answer"; fi
 
 step "2. The backend does not answer from the internet"

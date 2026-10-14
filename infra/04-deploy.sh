@@ -194,7 +194,7 @@ step "Frontend: sign-in required (Microsoft Entra ID)"
 # Configured before the application is given its real settings, so there is no moment in
 # which the frontend serves the app without asking for a sign-in.
 az containerapp auth microsoft update --name "$WEB_APP" --resource-group "$RESOURCE_GROUP" \
-  --client-id "$CLIENT_ID" --tenant-id "$TENANT_ID" --allowed-audiences "$CLIENT_ID" "api://$CLIENT_ID" \
+  --client-id "$CLIENT_ID" --tenant-id "$TENANT_ID" --allowed-audiences "$CLIENT_ID,api://$CLIENT_ID" \
   --yes --only-show-errors --output none
 az containerapp auth update --name "$WEB_APP" --resource-group "$RESOURCE_GROUP" \
   --enabled true --unauthenticated-client-action RedirectToLoginPage --redirect-provider azureactivedirectory \

@@ -62,6 +62,10 @@ SECRET_OPENAI_ENDPOINT="azure-openai-endpoint"
 CONTAINERAPP_API="2024-03-01"
 ENTRA_APP_NAME="${ENTRA_APP_NAME:-Contoso Invoice Matching (demo)}"
 DEMO_USER_PREFIX="${DEMO_USER_PREFIX:-contoso-demo}"
+# Unique suffix for globally-scoped resource names (storage account, registry). Set by
+# 01-foundation.sh on the first run and persisted in infra/.env.deploy so every script uses
+# the same value. Override here only if the resources were created with a different suffix.
+SUFFIX="${SUFFIX:-}"
 
 # Resource providers the deployment uses. Registering one is free.
 COST_PROVIDERS=(Microsoft.Consumption Microsoft.CostManagement)
@@ -132,10 +136,7 @@ confirm() {
 }
 
 require_tools() {
-  local tool
-  for tool in az sha256sum; do
-    command -v "$tool" > /dev/null 2>&1 || die "'$tool' is not installed or not on the PATH."
-  done
+  command -v az > /dev/null 2>&1 || die "'az' is not installed or not on the PATH."
   succeeds az account show || die "The Azure CLI is not signed in. Run: az login"
 }
 
@@ -157,13 +158,27 @@ load_subscription() {
   QUOTA_ID="$(az rest --method get --url "$url" --query subscriptionPolicies.quotaId -o tsv)"
   SPENDING_LIMIT="$(az rest --method get --url "$url" --query subscriptionPolicies.spendingLimit -o tsv)"
 
-  # Globally unique names (storage account, registry) get a suffix derived from the
-  # subscription id: the same on every run, different from anyone else's.
-  local suffix
-  suffix="$(printf '%s' "$SUBSCRIPTION_ID" | sha256sum | cut -c1-8)"
+  # Globally unique names (storage account, registry) need a suffix that is the same on
+  # every run for this subscription. SUFFIX is read from .env.deploy when it exists (written
+  # there by 01-foundation.sh). On a first run it is computed here and 01-foundation.sh saves
+  # it. sha256sum is tried first; python and PowerShell are fallbacks for Windows/Git Bash.
+  if [ -z "$SUFFIX" ]; then
+    local stripped="${SUBSCRIPTION_ID//-/}"
+    if command -v sha256sum > /dev/null 2>&1; then
+      SUFFIX="$(printf '%s' "$stripped" | sha256sum | cut -c1-8)"
+    elif command -v python3 > /dev/null 2>&1; then
+      SUFFIX="$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])" "$stripped")"
+    elif command -v python > /dev/null 2>&1; then
+      SUFFIX="$(python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])" "$stripped")"
+    else
+      SUFFIX="$(powershell -NoProfile -Command \
+        "([System.BitConverter]::ToString(([System.Security.Cryptography.SHA256]::Create()).ComputeHash([System.Text.Encoding]::UTF8.GetBytes('$stripped'))).Replace('-','')).Substring(0,8).ToLower()" \
+        | tr -d '\r')"
+    fi
+  fi
   local compact="${PREFIX//-/}"
-  STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-st${compact}${suffix}}"
-  REGISTRY="${REGISTRY:-acr${compact}${suffix}}"
+  STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-st${compact}${SUFFIX}}"
+  REGISTRY="${REGISTRY:-acr${compact}${SUFFIX}}"
 }
 
 # The whole plan rests on this: a free account charges nothing while its spending limit is
