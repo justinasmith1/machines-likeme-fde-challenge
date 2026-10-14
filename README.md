@@ -6,11 +6,11 @@ Contoso receives supplier invoices. Each invoice is matched against its purchase
 
 Only invoice data extraction uses an LLM (Azure OpenAI). The rules engine is pure, deterministic Python with unit tests.
 
-Status: reference data loader (phase 1), rules engine (phase 2), invoice extraction (phase 3), matching, persistence, audit trail, business services and the HTTP API (phase 4), and the web frontend for the three roles (phase 5) are implemented. Real authentication (Microsoft Entra ID) and deployment are not implemented yet.
+Status: all six phases are implemented and deployed. Reference data loader (phase 1), rules engine with unit tests (phase 2), invoice extraction via Azure OpenAI (phase 3), matching, persistence, audit trail, business services and the HTTP API (phase 4), the web frontend for the three roles (phase 5), and Microsoft Entra ID authentication with Azure Container Apps deployment (phase 6).
 
 ## Architecture
 
-_Placeholder. To be completed once extraction, engine, persistence and the frontend exist._
+The backend is a FastAPI application; the frontend is a Next.js App Router application. In deployment they run as two Docker container images on Azure Container Apps and share one origin: the browser talks only to the frontend, and the frontend's `/api` proxy forwards requests to the backend. See the [Deployment](#deployment) section for the Azure infrastructure.
 
 ```
 backend/app/
@@ -29,7 +29,7 @@ backend/scripts/
 frontend/
   app/         Next.js App Router pages: login, invoices, review queue, invoice detail, parameters
   components/  screens and their parts
-  lib/auth/    the only module that knows who the user is (development login now, Entra ID in phase 6)
+  lib/auth/    the only module that knows who the user is; development login in local dev, Entra ID in deployment
   lib/api/     the only module that calls the backend: typed client and error codes
   lib/proxy/   the frontend's own /api proxy to the backend, used when both share an origin
   lib/invoices/ what to show to whom: navigation by role, decisions as listed by the API, status names
@@ -273,9 +273,9 @@ CORS allows only the origin in `FRONTEND_ORIGIN` (DL-58).
 
 Authentication sits behind a single dependency, `current_user`, which returns a user name and a role. Endpoints depend only on it.
 
-- **Now (development).** When `APP_ENV=development` is set explicitly, the user and role come from two request headers: `X-Dev-User` and `X-Dev-Role` (`INTAKE`, `AP_ANALYST` or `AP_MANAGER`). This is a development convenience, not security: anyone who can reach the API can claim any role.
-- **Any other environment, including when `APP_ENV` is not set.** The headers are ignored and every request is answered with `401`. `APP_ENV` defaults to `production`, so a system with missing configuration is closed, not open.
-- **Phase 6.** The dependency is replaced by Microsoft Entra ID (token validation, roles from app roles or groups). Endpoints and services do not change.
+- **Development (`APP_ENV=development`).** The user and role come from two request headers: `X-Dev-User` and `X-Dev-Role` (`INTAKE`, `AP_ANALYST` or `AP_MANAGER`). This is a development convenience, not security: anyone who can reach the API can claim any role.
+- **Entra ID (`APP_ENV=entra`).** The user and role come from the `X-MS-CLIENT-PRINCIPAL` header injected by Azure Easy Auth. The header is base64-encoded JSON with a `claims` array; the backend reads the `preferred_username` claim as the username and the `roles` claim for the role (`INTAKE`, `AP_ANALYST` or `AP_MANAGER`). When multiple roles are present the highest privilege wins. A missing header, a header with no recognised role, or a malformed value all answer `401`. Endpoints and services are unchanged.
+- **Any other environment, including when `APP_ENV` is not set.** Every request is answered with `401`. `APP_ENV` defaults to `production`, so a system with missing configuration is closed, not open (DL-55).
 
 ## Running the API locally
 
@@ -326,7 +326,7 @@ It has three runtime dependencies (`next`, `react`, `react-dom`) and no componen
 
 | Page | Intake | AP Analyst | AP Manager |
 |---|---|---|---|
-| `/login` | Development login: pick a user name and a role. Says it is for development only. | same | same |
+| `/login` | In development: pick a user name and a role (says it is for development only). In Entra mode: "You do not have access." with a Microsoft sign-in link. | same | same |
 | `/invoices` | Upload, with the size and type limits. List of documents: file, upload time, status and plain-language reasons. | Upload. List of all invoices, with a status filter and a link to each. | same |
 | `/review` | – | Review queue, oldest first. | same |
 | `/invoices/{id}` | – | The original document, which stays in view on wide screens, next to the extracted data and the evaluation; then the invoice lines and the decision across the whole page; correcting from the extracted data panel; reading status of each field; lines with the PO line they were matched to and the method; the evaluation with every reason; decisions, corrections and retry; history of decisions, of evaluations and of extraction versions. | Same, plus the audit trail as a timeline. |
@@ -352,7 +352,7 @@ It has three runtime dependencies (`next`, `react`, `react-dom`) and no componen
 
 ### Identity is in one module
 
-Everything about who the user is goes through `lib/auth`: the current session, signing out, and the headers that authenticate a request. Screens and the API client use only that. In development the module keeps the chosen user and role in `sessionStorage` and adds the `X-Dev-User` and `X-Dev-Role` headers; only `lib/auth/dev.ts` and the login page know that. Phase 6 replaces the provider with Microsoft Entra ID without touching the screens (DL-65).
+Everything about who the user is goes through `lib/auth`: the current session, signing out, and the headers that authenticate a request. Screens and the API client use only that. In development the module keeps the chosen user and role in `sessionStorage` and adds the `X-Dev-User` and `X-Dev-Role` headers; only `lib/auth/dev.ts` and the login page know that. In deployment (`NEXT_PUBLIC_AUTH_MODE=entra`) the provider reads the session from Easy Auth's `/.auth/me` endpoint and signs out to `/.auth/logout`; `lib/auth/entra.ts` is the only module that knows this (DL-65).
 
 Hiding a button is a convenience, not security. The API enforces every permission, and each screen handles a 403 even when the button should not have been there: the message is shown and the page stays usable.
 
@@ -387,7 +387,7 @@ In development, React's Strict Mode (on by default in Next.js) mounts every comp
 - **Target read on every request.** `API_PROXY_TARGET` (default `http://localhost:8000`) is the backend's origin, without `/api`. Nothing about the backend is stored in the build.
 - **What is forwarded.** The method, the path, the query string and the body. The body is streamed through, not loaded into memory.
 - **Headers are an allow-list.** Only `Accept`, `Accept-Language`, `Content-Type` and the identity headers go to the backend. `Host`, hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, `Proxy-*`), cookies and `Authorization` are not forwarded. On the way back, hop-by-hop and CORS headers are dropped.
-- **Identity in one place.** One function, `identityHeaders`, decides which identity travels to the backend. Today it passes the development headers. Phase 6 changes that function to pass the identity Azure injects in front of the frontend; nothing else in the proxy changes.
+- **Identity in one place.** One function, `identityHeaders`, decides which identity travels to the backend. In development mode it forwards the `X-Dev-*` headers. In Entra mode it forwards `X-MS-CLIENT-PRINCIPAL`, the header Azure Easy Auth injects, and drops any `X-Dev-*` headers the client may have sent. Nothing else in the proxy changes between modes.
 - **Upload limit.** A request whose `Content-Length` is above the upload limit is refused with `413 FILE_TOO_LARGE`, in the backend's error format, without sending the body anywhere. A body with no declared length is counted as it streams and cut off at the same point. The limit is `MAX_UPLOAD_MB` (default 10), the same setting the backend uses, plus 64 KB for the multipart envelope; a file just over the limit therefore reaches the backend, which measures the file itself and answers `413`.
 - **Backend not answering.** A connection failure or a 60-second timeout gives `502` with the stable code `BACKEND_UNAVAILABLE` and a plain message. The detail goes to the frontend's server log only.
 - **Everything else** comes back as the backend sent it: status, body and error codes.
@@ -463,7 +463,6 @@ MSYS_NO_PATHCONV=1 API_BASE_URL=/api API_PROXY_TARGET=http://localhost:8000 node
 - **The visual design is not tested as an image.** Contrast and the rule-carrying styles are checked from the CSS, but nothing compares screenshots; how a page looks is judged by eye.
 - **Cached data can be briefly out of date.** A view shown from the cache is as old as the last visit until its refresh arrives, usually well under a second. Changes made by someone else are seen only at that refresh: the cache is invalidated by this browser's own actions, not by other people's. The API decides on current data in every case, so an action on an out-of-date view is refused or applied correctly, never applied to old data.
 - **The supplier's name is the master's current one.** It is looked up when the page is requested, not stored with the invoice, so it follows later changes to the supplier master.
-- **Development login only.** Identity is not verified until phase 6.
 - **Document viewer.** It relies on the browser's built-in PDF and image viewers. A browser without an inline PDF viewer shows only the link to open the file.
 - **No pagination or search** in the lists.
 - **Polling, not push.** A status change appears within about 3 seconds while the page is open.
@@ -476,7 +475,7 @@ Read from environment variables / `.env` (see `.env.example`).
 
 | Variable | Default | Notes |
 |---|---|---|
-| `APP_ENV` | `production` | Set to `development` in a local `.env` to enable the development login headers. Any other value, or no value, disables them (DL-55) |
+| `APP_ENV` | `production` | `development`: enables the `X-Dev-User` / `X-Dev-Role` headers (local only). `entra`: reads identity from the Azure-injected `X-MS-CLIENT-PRINCIPAL` header. Any other value, or no value, closes the API (DL-55) |
 | `FRONTEND_ORIGIN` | `http://localhost:3000` | The only browser origin allowed to call the API (DL-58) |
 | `AZURE_OPENAI_ENDPOINT` | – | Base URL of the v1 API; requests go to `{endpoint}/responses`. Needed only for extraction |
 | `AZURE_OPENAI_API_KEY` | – | Secret. Needed only for extraction |
@@ -512,11 +511,115 @@ Read from environment variables / `.env` (see `.env.example`).
 
 ## Deployment
 
-_Placeholder._
+The application runs on **Azure Container Apps** (consumption plan, East US 2) behind **Microsoft Entra ID** authentication. It is live at:
+
+```
+https://ca-contoso-im-web.calmriver-a0f6fc81.eastus2.azurecontainerapps.io
+```
+
+### Infrastructure overview
+
+| Component | Azure resource | Notes |
+|---|---|---|
+| Frontend | Container App `ca-contoso-im-web` | Next.js standalone image; Easy Auth (Entra ID) in front |
+| Backend | Container App `ca-contoso-im-api` | FastAPI image; internal only, not reachable from the internet |
+| Database | SQLite on Azure Files | Mounted at `/app/data` with `nobrl`; one replica only |
+| Images | Azure Container Registry `acrcontosoim37ef8709` | Tagged by the short git commit SHA |
+| Identity | Microsoft Entra ID app `830ba5df-1727-4847-bdd1-0e0a86172844` | App roles: `INTAKE`, `AP_ANALYST`, `AP_MANAGER` |
+| Environment | Azure Container Apps environment | Shared VNET; backend is on `.internal.*` address |
+
+The frontend and backend share one origin: the browser talks only to the frontend, and the frontend's `/api` proxy forwards requests to the backend's internal address. No CORS is involved in production. The backend is not reachable from the internet.
+
+```mermaid
+graph TD
+    Browser["🌐 Browser"]
+    EasyAuth["Easy Auth\n(Microsoft Entra ID)"]
+    Web["Container App\nca-contoso-im-web\nNext.js"]
+    API["Container App\nca-contoso-im-api\nFastAPI\n(internal only)"]
+    Files["Azure Files\nSQLite · uploads"]
+    ACR["Azure Container\nRegistry"]
+    OpenAI["Azure OpenAI\ntechnical-challenge-foundry"]
+
+    Browser -->|"HTTPS"| EasyAuth
+    EasyAuth -->|"X-MS-CLIENT-PRINCIPAL"| Web
+    Web -->|"/api proxy (internal)"| API
+    API -->|"mount nobrl"| Files
+    API -->|"Responses API"| OpenAI
+    ACR -.->|"image pull"| Web
+    ACR -.->|"image pull"| API
+```
+
+### Authentication
+
+Authentication is handled by Azure's **Easy Auth** feature on the frontend Container App. Unauthenticated requests are redirected to Microsoft's sign-in page. After sign-in, Easy Auth injects an `X-MS-CLIENT-PRINCIPAL` header (base64-encoded JSON) into every forwarded request. The frontend's `/api` proxy forwards that header unchanged to the backend; the backend's `current_user` dependency reads and validates it when `APP_ENV=entra`.
+
+App roles are assigned per user in the Entra ID Enterprise Application. The three test users (`contoso-demo-intake`, `contoso-demo-analyst`, `contoso-demo-manager`) are pre-assigned. Admin consent for the application's permissions was granted by the tenant administrator.
+
+### Secrets management
+
+The Azure OpenAI endpoint and API key are stored as Container App secrets on the backend only. The frontend holds no secret. The secret values are never in the repository or in any Docker image; they are injected at deploy time by `infra/04-deploy.sh` from the operator's local environment.
+
+### Scripts
+
+All infrastructure is managed through scripts in `infra/`. State shared between scripts (resource name suffix, resource group, ACR name, etc.) is written to `infra/.env.deploy` on the first run of `01-foundation.sh` and read on every subsequent run. That file is git-ignored.
+
+| Script | What it does |
+|---|---|
+| `infra/00-preflight.sh` | Verifies the subscription, CLI version, resource providers and quotas. Run before anything else. |
+| `infra/01-foundation.sh` | Creates the resource group, ACR, storage account, file share and Container Apps environment. Run once. |
+| `infra/02-entra.sh` | Registers the Entra ID application, creates the three app roles and sets the redirect URI. Run once. |
+| `infra/03-build-push.sh` | Builds the two Docker images for `linux/amd64`, checks they contain no secrets or test data, and pushes them to ACR. |
+| `infra/04-deploy.sh <tag>` | Creates or updates both Container Apps with the given image tag, configures Easy Auth, mounts the file share and sets the model secrets. |
+| `infra/05-smoke.sh` | Verifies the live deployment: that unauthenticated requests are refused, the backend is private, and forged identity headers are rejected. |
+| `infra/load-reference.sh` | Loads the reference data (suppliers, purchase orders, goods received notes) into the deployed backend via the CLI inside the container. |
+
+### Cost
+
+Both Container Apps are on the **consumption plan** and **scale to zero** when idle. There is no cost while no requests are being served. The first request after a pause takes a few seconds while the containers start.
+
+### SQLite and scale
+
+The current deployment uses one replica and SQLite on an Azure Files share (mounted with `nobrl` to disable byte-range locking, which Azure Files does not support). This is adequate for a demo and for single-writer production use. Moving to multiple replicas requires replacing SQLite with PostgreSQL or Azure SQL; the `DATABASE_URL` setting and SQLAlchemy's dialect abstraction make that a configuration change with no code change to the services.
 
 ## Release process
 
-_Placeholder._
+To release a change:
+
+1. **Merge to `main`.** All changes go through a pull request. Tests must pass locally before opening the PR (`pytest` from `backend/`, `npm test` and `npm run typecheck` from `frontend/`).
+
+2. **Build and push a new image.**
+
+   ```bash
+   bash infra/03-build-push.sh
+   ```
+
+   The tag is the short git SHA of the commit being released (`git rev-parse --short HEAD`). The script builds both images for `linux/amd64`, verifies they contain no secrets or test files, and pushes them to ACR.
+
+3. **Deploy.**
+
+   ```bash
+   bash infra/04-deploy.sh <tag>
+   ```
+
+   The script updates both Container Apps to the new image tag. A request in progress at the moment of the swap may fail; extraction running at that moment is interrupted and the invoice stays `EXTRACTION_FAILED` (retriable).
+
+4. **Smoke test.**
+
+   ```bash
+   bash infra/05-smoke.sh
+   ```
+
+5. **Load reference data** (only if the reference JSON files changed).
+
+   ```bash
+   bash infra/load-reference.sh
+   ```
+
+All scripts are idempotent: running them again with the same tag is safe.
+
+**Schema changes.** The backend creates missing tables with `create_all` but never alters existing ones. After a schema change, the database file on the Azure Files share must be deleted and the reference data reloaded. A migration tool (Alembic) is the right answer for a production database; adding it was out of scope for this challenge.
+
+**Rollback.** Re-run `infra/04-deploy.sh` with the previous tag.
 
 ## Decision log
 
