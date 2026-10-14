@@ -45,9 +45,8 @@ export function AppShell({ title, roles, activeHref, children }: AppShellProps) 
     <>
       <header className="topbar">
         <span className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            ◆
-          </span>
+          {/* Decorative: the name is written next to it. */}
+          <img src="/logo.png" alt="" width={32} height={32} style={{ display: "block" }} />
           Contoso <span className="brand-product">Invoice Matching</span>
         </span>
         <nav aria-label="Main">

@@ -154,16 +154,6 @@ code {
   font-size: 1.02rem;
   white-space: nowrap;
 }
-.brand-mark {
-  display: inline-grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: var(--on-brand);
-  color: var(--brand);
-  font-size: 0.9rem;
-}
 .brand-product {
   font-weight: 400;
   opacity: 0.92;
@@ -232,7 +222,6 @@ code {
 .panel-primary {
   border-color: var(--brand-line);
   border-top: 4px solid var(--brand);
-  background: linear-gradient(var(--brand-soft), var(--surface) 72px);
 }
 .panel-primary h2 {
   color: var(--brand-strong);
@@ -803,6 +792,9 @@ ul.plain {
 .timeline table {
   margin-top: 8px;
 }
+.timeline .muted > .badge {
+  margin-left: 0.3rem;
+}
 blockquote {
   margin: 6px 0;
   padding: 4px 0 4px 12px;
@@ -845,7 +837,7 @@ blockquote {
   font-variant-numeric: tabular-nums;
 }
 .history-part > .timeline {
-  margin-top: 4px;
+  margin: 4px 0 14px;
 }
 
 /* ---- correcting, inside the "Extracted data" panel */
