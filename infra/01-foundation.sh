@@ -53,6 +53,14 @@ done
 require_tools
 load_subscription
 
+# Persist the suffix so every subsequent script resolves the same resource names without
+# recomputing it. Written once; never overwrites a value already in the file.
+ENV_DEPLOY="$INFRA_DIR/.env.deploy"
+if ! grep -q "^SUFFIX=" "$ENV_DEPLOY" 2>/dev/null; then
+  printf 'SUFFIX=%s\n' "$SUFFIX" >> "$ENV_DEPLOY"
+  info "Saved resource-name suffix to $ENV_DEPLOY (SUFFIX=$SUFFIX)."
+fi
+
 EMAIL_JSON=""
 if [ "$SKIP_BUDGET" = "0" ]; then
   [ -n "$EMAILS" ] || die "Pass --emails with the two addresses that receive the budget alerts."
