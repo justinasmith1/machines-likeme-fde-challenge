@@ -39,8 +39,11 @@ command -v git > /dev/null 2>&1 || die "git is not on the PATH."
 load_subscription
 
 step "Version"
-TAG="$(git -C "$(cd "$INFRA_DIR/.." && pwd)" rev-parse --short HEAD | tr -d '\r')"
-if [ -n "$(git -C "$(cd "$INFRA_DIR/.." && pwd)" status --porcelain -- backend frontend)" ]; then
+pushd "$INFRA_DIR/.." > /dev/null
+TAG="$(git rev-parse --short HEAD | tr -d '\r')"
+DIRTY="$(git status --porcelain -- backend frontend)"
+popd > /dev/null
+if [ -n "$DIRTY" ]; then
   if [ "$ALLOW_DIRTY" = "1" ]; then
     TAG="$TAG-dirty"
     warn "backend/ or frontend/ has uncommitted changes. The images get the tag $TAG."
