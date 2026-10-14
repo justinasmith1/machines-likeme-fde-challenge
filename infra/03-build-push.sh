@@ -62,8 +62,10 @@ info "Backend:  $API_REF"
 info "Frontend: $WEB_REF"
 
 step "Build (on this machine)"
-docker build --platform linux/amd64 --tag "$API_REF" "$INFRA_DIR/../backend"
-docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_AUTH_MODE=entra --tag "$WEB_REF" "$INFRA_DIR/../frontend"
+# Docker is a Windows program and lib.sh switches off Git Bash's path conversion, so the
+# folder is resolved here and handed over as a native path.
+docker build --platform linux/amd64 --tag "$API_REF" "$(native_path "$(cd "$INFRA_DIR/../backend" && pwd)")"
+docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_AUTH_MODE=entra --tag "$WEB_REF" "$(native_path "$(cd "$INFRA_DIR/../frontend" && pwd)")"
 
 # ---------------------------------------------------------------- what must not be inside
 
