@@ -22,3 +22,7 @@ data/cache/
 
 # Uploaded documents are real invoices
 data/uploads/
+
+# Deployment: local overrides of the names in infra/lib.sh, and anything kept locally
+infra/.env.deploy
+infra/*.local

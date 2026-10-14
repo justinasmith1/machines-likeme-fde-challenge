@@ -1,16 +1,21 @@
 "use client";
 
-// DEVELOPMENT LOGIN. This screen and lib/auth/dev are the only places that know how the
-// development identity works. Phase 6 replaces both with Microsoft Entra ID sign-in.
+// Two screens, one per identity provider (lib/auth):
+//  - Development: a login with no password. This screen and lib/auth/dev are the only
+//    places that know how the development identity works.
+//  - Entra: nobody signs in here. Azure sends visitors to Microsoft's sign-in page before
+//    they reach the app; this screen is only for someone who signed in but has no role in
+//    the application, or whose session ended.
 
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
-import { ErrorNotice } from "@/components/Feedback";
+import { useEffect, useState, type FormEvent } from "react";
+import { ErrorNotice, Loading } from "@/components/Feedback";
 import { useApi } from "@/components/Providers";
 import { isApiError } from "@/lib/api/errors";
 import type { Role } from "@/lib/api/types";
-import { auth } from "@/lib/auth";
+import { auth, useSession } from "@/lib/auth";
 import { DEV_ROLES, devSignIn } from "@/lib/auth/dev";
+import { SIGN_IN_URL, SIGN_OUT_URL } from "@/lib/auth/entra";
 import { ROLE_LABELS, homeFor } from "@/lib/invoices/actions";
 
 const ROLE_HINTS: Record<Role, string> = {
@@ -20,6 +25,33 @@ const ROLE_HINTS: Record<Role, string> = {
 };
 
 export default function LoginPage() {
+  return auth.mode === "entra" ? <EntraSignIn /> : <DevelopmentLogin />;
+}
+
+function EntraSignIn() {
+  const session = useSession();
+  const router = useRouter();
+  useEffect(() => {
+    if (session) router.replace(homeFor(session.role));
+  }, [session, router]);
+
+  if (session === undefined || session) return <Loading what="Checking your session" />;
+  return (
+    <main className="login">
+      <h1>Contoso Invoice Matching</h1>
+      <div className="notice notice-warning" role="alert">
+        <strong>You do not have access.</strong> Either you are not signed in, or your account has not been
+        given a role in this application (Intake, AP Analyst or AP Manager). Roles are assigned by the
+        administrator of the directory.
+      </div>
+      <p>
+        <a href={SIGN_IN_URL}>Sign in with Microsoft</a> · <a href={SIGN_OUT_URL}>Sign out and use another account</a>
+      </p>
+    </main>
+  );
+}
+
+function DevelopmentLogin() {
   const api = useApi();
   const router = useRouter();
   const [username, setUsername] = useState("");

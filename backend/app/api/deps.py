@@ -1,10 +1,15 @@
 """FastAPI dependencies: database session, the invoice service, and the current user.
 
-Authentication is behind one dependency, current_user. In development it reads the user
-and role from the X-Dev-User and X-Dev-Role headers. In any other environment those
-headers are ignored and every request is refused with 401 until phase 6 replaces this
-dependency with Microsoft Entra ID. Endpoints depend only on current_user / require_roles,
-so they do not change when that happens.
+Authentication is behind one dependency, current_user. Where the identity comes from
+depends on APP_ENV:
+
+  development  the X-Dev-User and X-Dev-Role headers (local work only, no verification).
+  entra        the X-MS-CLIENT-PRINCIPAL header that Azure Container Apps authentication
+               injects after a Microsoft Entra ID sign-in (see app/api/identity.py).
+               The development headers are ignored.
+  anything else, including the default "production": every request is refused with 401.
+
+Endpoints depend only on current_user / require_roles, so they are the same in every mode.
 """
 
 import logging
@@ -15,6 +20,7 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.errors import ApiError, unauthenticated
+from app.api.identity import PRINCIPAL_HEADER, InvalidPrincipal, user_from_principal
 from app.config import Settings
 from app.domain.enums import Role
 from app.services.common import User
@@ -24,6 +30,7 @@ from app.storage.files import FileStore
 logger = logging.getLogger(__name__)
 
 DEVELOPMENT = "development"
+ENTRA = "entra"
 
 
 @dataclass
@@ -81,7 +88,14 @@ def process_in_background(state: AppState, invoice_id: int) -> None:
 
 
 def current_user(request: Request, state: AppState = Depends(get_state)) -> User:
-    if state.settings.app_env != DEVELOPMENT:
+    mode = state.settings.app_env
+    if mode == ENTRA:
+        # Only the identity injected by the platform counts. X-Dev-* is not even read.
+        try:
+            return user_from_principal(request.headers.get(PRINCIPAL_HEADER))
+        except InvalidPrincipal as exc:
+            raise unauthenticated(str(exc)) from None
+    if mode != DEVELOPMENT:
         # Development headers are never honoured outside development.
         raise unauthenticated("Authentication is not configured for this environment.")
     username = (request.headers.get("X-Dev-User") or "").strip()

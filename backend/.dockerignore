@@ -1,0 +1,17 @@
+# Only pyproject.toml and app/ are needed to build the image. Everything else stays out,
+# first of all secrets and data.
+.env
+.env.*
+*.db
+*.sqlite
+data/
+tests/
+scripts/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+Dockerfile
+.dockerignore

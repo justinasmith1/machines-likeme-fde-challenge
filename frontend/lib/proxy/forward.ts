@@ -37,19 +37,32 @@ export function maxUploadMb(env: Env = process.env): number {
 /**
  * THE ONE PLACE that decides which identity travels to the backend.
  *
- * Today: the development headers set by lib/auth (the backend honours them only when it
- * runs with APP_ENV=development).
+ * Development: the X-Dev-* headers set by lib/auth/dev. The backend honours them only
+ * when it runs with APP_ENV=development.
  *
- * Phase 6: replace the list below with the identity Azure injects in front of this
- * server (for example the X-MS-CLIENT-PRINCIPAL* headers of App Service authentication,
- * or a validated token). Nothing else in the proxy needs to change. Until then no cookie
- * and no Authorization header is forwarded.
+ * Entra (NEXT_PUBLIC_AUTH_MODE=entra): the X-MS-CLIENT-PRINCIPAL header that Azure
+ * Container Apps authentication adds in front of this server after a Microsoft Entra ID
+ * sign-in. Azure does not let a request from outside set it, so what arrives here is the
+ * platform's. The X-Dev-* headers are never forwarded in this mode, whatever a client
+ * sends. The backend reads the header when it runs with APP_ENV=entra.
+ *
+ * In both modes no cookie and no Authorization header is forwarded.
  */
-const IDENTITY_HEADERS = ["x-dev-user", "x-dev-role"];
+const DEVELOPMENT_IDENTITY_HEADERS = ["x-dev-user", "x-dev-role"];
+const ENTRA_IDENTITY_HEADERS = ["x-ms-client-principal"];
 
-export function identityHeaders(incoming: Headers): Record<string, string> {
+/** Read from the environment of the running server, like the other proxy settings. */
+export function proxyAuthMode(env: Env = process.env): "entra" | "development" {
+  // Looked up by name at run time (Next.js only fixes the literal process.env.NEXT_PUBLIC_*
+  // form at build time), so the container's environment decides.
+  const name = "NEXT_PUBLIC_AUTH_MODE";
+  return env[name] === "entra" ? "entra" : "development";
+}
+
+export function identityHeaders(incoming: Headers, env: Env = process.env): Record<string, string> {
+  const names = proxyAuthMode(env) === "entra" ? ENTRA_IDENTITY_HEADERS : DEVELOPMENT_IDENTITY_HEADERS;
   const forwarded: Record<string, string> = {};
-  for (const name of IDENTITY_HEADERS) {
+  for (const name of names) {
     const value = incoming.get(name);
     if (value !== null) forwarded[name] = value;
   }
@@ -71,14 +84,14 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
-export function requestHeadersFor(incoming: Headers): Record<string, string> {
+export function requestHeadersFor(incoming: Headers, env: Env = process.env): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const name of FORWARDED_REQUEST_HEADERS) {
     const value = incoming.get(name);
     if (value !== null) headers[name] = value;
   }
   // Content-Length is not copied: the body is streamed, and the HTTP client frames it.
-  return { ...headers, ...identityHeaders(incoming) };
+  return { ...headers, ...identityHeaders(incoming, env) };
 }
 
 export function responseHeadersFor(upstream: Headers): Headers {
@@ -173,7 +186,7 @@ export async function forwardToBackend(
   try {
     upstream = await doFetch(url, {
       method: request.method,
-      headers: requestHeadersFor(request.headers),
+      headers: requestHeadersFor(request.headers, env),
       body,
       // Required by Node to send a streamed request body.
       ...(body ? { duplex: "half" } : {}),
