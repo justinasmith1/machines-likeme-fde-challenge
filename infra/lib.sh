@@ -132,10 +132,7 @@ confirm() {
 }
 
 require_tools() {
-  local tool
-  for tool in az sha256sum; do
-    command -v "$tool" > /dev/null 2>&1 || die "'$tool' is not installed or not on the PATH."
-  done
+  command -v az > /dev/null 2>&1 || die "'az' is not installed or not on the PATH."
   succeeds az account show || die "The Azure CLI is not signed in. Run: az login"
 }
 
@@ -159,9 +156,11 @@ load_subscription() {
 
   # Globally unique names (storage account, registry) get a suffix derived from the
   # subscription id: the same on every run, different from anyone else's.
-  local suffix
-  suffix="$(printf '%s' "$SUBSCRIPTION_ID" | sha256sum | cut -c1-8)"
-  local compact="${PREFIX//-/}"
+  # The subscription id is a UUID (hex + hyphens), so its first 8 hex chars are enough.
+  local suffix compact stripped
+  stripped="${SUBSCRIPTION_ID//-/}"
+  suffix="${stripped:0:8}"
+  compact="${PREFIX//-/}"
   STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-st${compact}${suffix}}"
   REGISTRY="${REGISTRY:-acr${compact}${suffix}}"
 }
