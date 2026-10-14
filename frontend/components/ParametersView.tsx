@@ -122,7 +122,9 @@ function ParameterEditor({ current, onSaved }: { current: RuleParameters; onSave
       <form onSubmit={submit}>
         <div className="formgrid">
           <div>
-            <label htmlFor="param-tolerance">Price tolerance (fraction, 0.02 = 2%)</label>
+            <label htmlFor="param-tolerance">
+              Price tolerance (fraction, {tolerance} = {formatPercent(tolerance)})
+            </label>
             <input id="param-tolerance" value={tolerance} onChange={(e) => setTolerance(e.target.value)} />
           </div>
           <div>
