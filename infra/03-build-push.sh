@@ -69,37 +69,42 @@ docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_AUTH_MODE=entra --ta
 
 # ---------------------------------------------------------------- what must not be inside
 
-# Runs a search inside an image and prints what it finds. Anything printed is a problem.
+# Runs a search inside an image and prints what it finds, then the line "__checked__".
+# Anything printed before that line is a problem; the line itself proves the search ran.
+# It never fails by itself: a container that does not start leaves no "__checked__".
 inside() { # inside <image> <shell script>
-  docker run --rm --platform linux/amd64 --entrypoint sh "$1" -c "$2" 2> /dev/null | tr -d '\r'
+  docker run --rm --platform linux/amd64 --entrypoint sh "$1" -c "$2"$'\n'"echo __checked__" 2>&1 || true
 }
 
 step "Check: no secrets, data or tests inside the images"
 FOUND_API="$(inside "$API_REF" '
-  site=$(python -c "import app, os; print(os.path.dirname(app.__file__))")
-  find /app /home /src "$site" /tmp \( -name ".env" -o -name ".env.*" -o -name "*.db" -o -name "*.sqlite" \) 2>/dev/null
-  find /app/data -mindepth 1 2>/dev/null
-  find "$site" -type d \( -name tests -o -name test-invoices -o -name uploads \) 2>/dev/null
-  find /app -mindepth 1 -maxdepth 1 -not -name data 2>/dev/null
-  find / -xdev -type f \( -name "suppliers.json" -o -name "purchase_orders.json" -o -name "goods_received_notes.json" \) 2>/dev/null
+  site=$(python -c "import app, os; print(os.path.dirname(app.__file__))" 2>/dev/null) || true
+  [ -n "$site" ] || echo "the installed application package was not found, so it was not searched"
+  find /app /home /src "$site" /tmp \( -name ".env" -o -name ".env.*" -o -name "*.db" -o -name "*.sqlite" \) 2>/dev/null || true
+  find /app/data -mindepth 1 2>/dev/null || true
+  find "$site" -type d \( -name tests -o -name test-invoices -o -name uploads \) 2>/dev/null || true
+  find /app -mindepth 1 -maxdepth 1 -not -name data 2>/dev/null || true
+  find / -xdev -type f \( -name "suppliers.json" -o -name "purchase_orders.json" -o -name "goods_received_notes.json" \) 2>/dev/null || true
 ')"
 FOUND_WEB="$(inside "$WEB_REF" '
-  find /app -path /app/node_modules -prune -o \( -name ".env" -o -name ".env.*" -o -name "*.db" \) -print 2>/dev/null
-  find /app -maxdepth 1 \( -name data -o -name tests -o -name "*.test.*" \) 2>/dev/null
+  find /app -path /app/node_modules -prune -o \( -name ".env" -o -name ".env.*" -o -name "*.db" \) -print 2>/dev/null || true
+  find /app -maxdepth 1 \( -name data -o -name tests -o -name "*.test.*" \) 2>/dev/null || true
 ')"
-if [ -n "$FOUND_API" ] || [ -n "$FOUND_WEB" ]; then
-  [ -n "$FOUND_API" ] && printf '   In the backend image:\n%s\n' "$FOUND_API" >&2
-  [ -n "$FOUND_WEB" ] && printf '   In the frontend image:\n%s\n' "$FOUND_WEB" >&2
+# An image the search could not run in proves nothing.
+grep -q '__checked__' <<< "$FOUND_API" \
+  || die "Backend image could not be inspected. Nothing was pushed."
+grep -q '__checked__' <<< "$FOUND_WEB" \
+  || die "Frontend image could not be inspected. Nothing was pushed."
+# Docker's own notices are not findings.
+CLEAN_API="$(grep -v '__checked__' <<< "$FOUND_API" | grep -v '^Error\|^Unable\|^WARNING' || true)"
+CLEAN_WEB="$(grep -v '__checked__' <<< "$FOUND_WEB" | grep -v '^Error\|^Unable\|^WARNING' || true)"
+if [ -n "$CLEAN_API" ] || [ -n "$CLEAN_WEB" ]; then
+  [ -n "$CLEAN_API" ] && printf '   In the backend image:\n%s\n' "$CLEAN_API" >&2
+  [ -n "$CLEAN_WEB" ] && printf '   In the frontend image:\n%s\n' "$CLEAN_WEB" >&2
   die "The files above must not be in an image. Nothing was pushed. Check the .dockerignore files."
 fi
 info "Backend image:  nothing found."
 info "Frontend image: nothing found."
-# The check itself has to be able to see inside: an image it cannot run proves nothing.
-[ "$(inside "$API_REF" 'python -c "import app.main; print(1)"')" = "1" ] \
-  || die "The backend image could not be inspected (the application does not import). Nothing was pushed."
-[ "$(inside "$WEB_REF" 'test -f /app/server.js && echo 1')" = "1" ] \
-  || die "The frontend image could not be inspected (server.js is missing). Nothing was pushed."
-info "Both images start a shell and contain the application."
 
 # ---------------------------------------------------------------- push
 
